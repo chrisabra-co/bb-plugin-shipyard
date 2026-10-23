@@ -232,7 +232,7 @@ export function BoardPage({ subPath }: { subPath: string }) {
                 }}
                 onDrop={(event) => onDrop(event, column)}
                 className={cn(
-                  "flex h-full min-w-60 max-w-96 flex-1 basis-0 flex-col rounded-xl border border-transparent bg-muted/40 transition-colors",
+                  "flex h-full min-w-52 max-w-96 flex-1 basis-0 flex-col rounded-xl border border-transparent bg-muted/40 transition-colors",
                   isTarget && "border-primary/40 bg-primary/5",
                 )}
               >

@@ -339,7 +339,6 @@ export function TaskDialog({
                   setEditing(true);
                 }}
               >
-                <Icon name="Pencil" className="size-3.5" />
                 Edit
               </Button>
             ) : null
