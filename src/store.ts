@@ -5,6 +5,11 @@ import { randomBytes } from "node:crypto";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import {
   type ColumnId,
+  type PlanMode,
+  type SettingsOverrides,
+  type StageSkills,
+  settingsOverridesSchema,
+  stageSkillsSchema,
   type Lesson,
   type Phase,
   type PullRequestInfo,
@@ -12,9 +17,12 @@ import {
   type ReviewReason,
   type Task,
   type TaskEvent,
+  type Signal,
   type Triage,
+  RUNNING_PHASES,
   pullRequestSchema,
   reportSchema,
+  signalSchema,
   triageResultSchema,
 } from "./model";
 
@@ -64,7 +72,28 @@ const MIGRATIONS = [
     created_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS lessons_project ON lessons(project_id, created_at)`,
+  // v0.2: Ideas and Brainstorm replace Planning; validation is a stage of In Progress.
+  `UPDATE tasks SET column_id = 'ideas' WHERE column_id = 'planning'`,
+  `UPDATE tasks SET column_id = 'in_progress' WHERE column_id = 'ai_review'`,
+  `ALTER TABLE tasks ADD COLUMN plan_mode TEXT NOT NULL DEFAULT 'auto'`,
+  `ALTER TABLE tasks ADD COLUMN stage_skills TEXT`,
+  `ALTER TABLE tasks ADD COLUMN plan TEXT`,
+  // One row per project; the row with project_id '*' holds the default stage skills.
+  `CREATE TABLE IF NOT EXISTS project_settings (
+    project_id TEXT PRIMARY KEY,
+    overrides TEXT NOT NULL DEFAULT '{}',
+    stage_skills TEXT NOT NULL DEFAULT '{}',
+    updated_at INTEGER NOT NULL
+  )`,
+  // The furthest build stage a task's thread started, so a restart resumes there.
+  `ALTER TABLE tasks ADD COLUMN reached TEXT`,
+  `UPDATE tasks SET reached = 'implement' WHERE triage IS NOT NULL AND thread_id IS NOT NULL`,
+  // The agent's shipyard_done signal for the current stage.
+  `ALTER TABLE tasks ADD COLUMN signal TEXT`,
 ];
+
+/** project_settings row that holds the default stage skills for every project. */
+export const DEFAULTS_ROW = "*";
 
 interface TaskRow {
   id: string;
@@ -85,6 +114,11 @@ interface TaskRow {
   report: string | null;
   pr: string | null;
   changed_files: string | null;
+  plan_mode: string;
+  stage_skills: string | null;
+  plan: string | null;
+  reached: string | null;
+  signal: string | null;
   merge_attempts: number;
   created_at: number;
   updated_at: number;
@@ -92,9 +126,12 @@ interface TaskRow {
   completed_at: number | null;
 }
 
+export type Reached = "plan" | "implement";
+
 export interface StoredTask extends Task {
   titleAuto: boolean;
   mergeAttempts: number;
+  reached: Reached | null;
 }
 
 function parseJson<T>(
@@ -142,6 +179,11 @@ function toTask(row: TaskRow): StoredTask {
     report: parseJson<Report>(row.report, reportSchema),
     pullRequest: parseJson<PullRequestInfo>(row.pr, pullRequestSchema),
     changedFiles: parseFiles(row.changed_files),
+    planMode: (row.plan_mode as PlanMode | null) ?? "auto",
+    stageSkills: parseJson<StageSkills>(row.stage_skills, stageSkillsSchema) ?? {},
+    plan: row.plan,
+    reached: row.reached === "plan" || row.reached === "implement" ? row.reached : null,
+    signal: parseJson<Signal>(row.signal, signalSchema),
     mergeAttempts: row.merge_attempts,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -168,6 +210,11 @@ export interface TaskPatch {
   report?: Report | null;
   pullRequest?: PullRequestInfo | null;
   changedFiles?: string[];
+  planMode?: PlanMode;
+  stageSkills?: StageSkills;
+  plan?: string | null;
+  reached?: Reached | null;
+  signal?: Signal | null;
   mergeAttempts?: number;
   startedAt?: number | null;
   completedAt?: number | null;
@@ -190,16 +237,23 @@ const PATCH_COLUMNS: Record<keyof TaskPatch, string> = {
   report: "report",
   pullRequest: "pr",
   changedFiles: "changed_files",
+  planMode: "plan_mode",
+  stageSkills: "stage_skills",
+  plan: "plan",
+  reached: "reached",
+  signal: "signal",
   mergeAttempts: "merge_attempts",
   startedAt: "started_at",
   completedAt: "completed_at",
 };
 
 const JSON_FIELDS = new Set<keyof TaskPatch>([
+  "signal",
   "triage",
   "report",
   "pullRequest",
   "changedFiles",
+  "stageSkills",
 ]);
 
 export function newId(prefix: string): string {
@@ -284,13 +338,15 @@ export class Store {
     titleAuto: boolean;
     description: string;
     column: ColumnId;
+    planMode: PlanMode;
+    stageSkills: StageSkills;
   }): StoredTask {
     const now = Date.now();
     const id = newId("sy");
     this.db
       .prepare(
-        `INSERT INTO tasks (id, project_id, title, title_auto, description, column_id, position, phase, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO tasks (id, project_id, title, title_auto, description, column_id, position, phase, plan_mode, stage_skills, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -301,6 +357,8 @@ export class Store {
         input.column,
         this.endPosition(input.projectId, input.column),
         input.column === "queue" ? "queued" : "idle",
+        input.planMode,
+        JSON.stringify(input.stageSkills),
         now,
         now,
       );
@@ -308,9 +366,13 @@ export class Store {
   }
 
   updateTask(id: string, input: TaskPatch): StoredTask {
-    // A note describes the current phase, so a new phase clears it.
-    const patch: TaskPatch =
-      input.phase !== undefined && !("note" in input) ? { ...input, note: null } : input;
+    // A note describes the current phase, so a new phase clears it. A
+    // signal ends a stage, so starting a new stage clears it; it stays while
+    // the task waits in review, so the board can show it.
+    let patch: TaskPatch = input.phase !== undefined && !("note" in input) ? { ...input, note: null } : input;
+    if (patch.phase !== undefined && RUNNING_PHASES.has(patch.phase) && !("signal" in patch)) {
+      patch = { ...patch, signal: null };
+    }
     const keys = (Object.keys(patch) as (keyof TaskPatch)[]).filter(
       (key) => patch[key] !== undefined,
     );
@@ -353,6 +415,26 @@ export class Store {
         )
         .all(taskId, limit) as TaskEvent[]
     ).reverse();
+  }
+
+  /** A project's overrides and stage skills; DEFAULTS_ROW holds the default stage skills. */
+  projectSettings(projectId: string): { overrides: SettingsOverrides; stageSkills: StageSkills } {
+    const row = this.db
+      .prepare(`SELECT overrides, stage_skills FROM project_settings WHERE project_id = ?`)
+      .get(projectId) as { overrides: string; stage_skills: string } | undefined;
+    return {
+      overrides: parseJson<SettingsOverrides>(row?.overrides ?? null, settingsOverridesSchema) ?? {},
+      stageSkills: parseJson<StageSkills>(row?.stage_skills ?? null, stageSkillsSchema) ?? {},
+    };
+  }
+
+  saveProjectSettings(projectId: string, value: { overrides: SettingsOverrides; stageSkills: StageSkills }): void {
+    this.db
+      .prepare(
+        `INSERT INTO project_settings (project_id, overrides, stage_skills, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(project_id) DO UPDATE SET overrides = excluded.overrides, stage_skills = excluded.stage_skills, updated_at = excluded.updated_at`,
+      )
+      .run(projectId, JSON.stringify(value.overrides), JSON.stringify(value.stageSkills), Date.now());
   }
 
   listLessons(projectId: string): Lesson[] {
@@ -400,6 +482,6 @@ export class Store {
 
 /** Strip the internal fields before a task crosses the RPC boundary. */
 export function publicTask(task: StoredTask): Task {
-  const { titleAuto: _titleAuto, mergeAttempts: _mergeAttempts, ...rest } = task;
+  const { titleAuto: _titleAuto, mergeAttempts: _mergeAttempts, reached: _reached, ...rest } = task;
   return rest;
 }

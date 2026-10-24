@@ -1,66 +1,41 @@
+// The Shipyard page: one project's tasks as a board or a list, the task
+// panel, and the settings. Routes: <projectId>, <projectId>/board,
+// <projectId>/list, <projectId>/settings, and settings.
 import { useEffect, useMemo, useState } from "react";
-import type { DragEvent } from "react";
 import {
   experimental_usePluginId,
   experimental_useSidebarThreads,
   useBbContext,
   useBbNavigate,
-  useSdk,
 } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
-import { cn } from "@/lib/utils";
-import { COLUMNS, COLUMN_LABELS, type ColumnId, RUNNING_PHASES } from "../constants";
+import { COLUMNS, type ColumnId, RUNNING_PHASES } from "../constants";
 import type { Task } from "../model";
+import { BoardView } from "./BoardView";
 import { LessonsDialog, NewTaskDialog } from "./dialogs";
-import { NativeSelect, attempt, useBoard } from "./shared";
-import { DRAG_TYPE, TaskCard } from "./TaskCard";
-import { TaskDialog } from "./TaskDialog";
+import { ListView } from "./ListView";
+import { SettingsView } from "./SettingsView";
+import { NativeSelect, Segmented, useBoard, useProjects, useElementWidth } from "./shared";
+import { TaskPanel } from "./TaskPanel";
 
-const COLUMN_HINTS: Record<ColumnId, string> = {
-  planning: "Draft tasks here. Nothing runs yet.",
-  queue: "Starts when a slot is free.",
-  in_progress: "Triage, then implementation.",
-  ai_review: "Checks and a fresh-eyes review.",
-  human_review: "Your turn: review, request changes, or merge.",
-  done: "",
-};
+type View = "board" | "list" | "settings";
+const VIEWS: readonly View[] = ["board", "list", "settings"];
 
-interface ProjectOption {
-  id: string;
-  name: string;
+function readStorage(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
 }
 
-function useProjects() {
-  const sdk = useSdk();
-  const [projects, setProjects] = useState<ProjectOption[] | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    sdk.projects.list().then(
-      (list) => {
-        if (!cancelled) setProjects(list.map((project) => ({ id: project.id, name: project.name })));
-      },
-      () => {
-        if (!cancelled) setProjects([]);
-      },
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, [sdk]);
-  return projects;
-}
-
-/** Position for a card dropped before `beforeId`, or at the column's end. */
-function dropPosition(cards: Task[], movingId: string, beforeId: string | null): number {
-  const others = cards.filter((card) => card.id !== movingId);
-  if (others.length === 0) return 1;
-  if (beforeId === null) return (others[others.length - 1]?.position ?? 0) + 1;
-  const index = others.findIndex((card) => card.id === beforeId);
-  if (index <= 0) return (others[0]?.position ?? 1) - 1;
-  const before = others[index - 1]?.position ?? 0;
-  const after = others[index]?.position ?? before + 2;
-  return (before + after) / 2;
+function writeStorage(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    // storage is optional
+  }
 }
 
 export function BoardPage({ subPath }: { subPath: string }) {
@@ -68,101 +43,96 @@ export function BoardPage({ subPath }: { subPath: string }) {
   const navigate = useBbNavigate();
   const context = useBbContext();
   const projects = useProjects();
-  const storageKey = `${pluginId}:last-project`;
+  const projectKey = `${pluginId}:last-project`;
+  const viewKey = `${pluginId}:view`;
 
-  const routeProjectId = subPath.split("/")[0] || null;
+  // "settings" alone opens the settings of the last project.
+  const [routeProjectId, routeView, routeTaskKey, routeTaskId] =
+    subPath === "settings" ? [undefined, "settings"] : subPath.split("/");
   const projectId = useMemo(() => {
     if (!projects || projects.length === 0) return null;
     const known = (id: string | null | undefined) =>
       id && projects.some((project) => project.id === id) ? id : null;
-    let remembered: string | null = null;
-    try {
-      remembered = window.localStorage.getItem(storageKey);
-    } catch {
-      remembered = null;
-    }
-    return known(routeProjectId) ?? known(context.projectId) ?? known(remembered) ?? projects[0]?.id ?? null;
-  }, [projects, routeProjectId, context.projectId, storageKey]);
+    return known(routeProjectId) ?? known(context.projectId) ?? known(readStorage(projectKey)) ?? projects[0]?.id ?? null;
+  }, [projects, routeProjectId, context.projectId, projectKey]);
+  const remembered = readStorage(viewKey) === "list" ? "list" : "board";
+  const view: View = VIEWS.includes(routeView as View) ? (routeView as View) : remembered;
 
   useEffect(() => {
-    if (!projectId) return;
-    try {
-      window.localStorage.setItem(storageKey, projectId);
-    } catch {
-      // storage is optional
-    }
-  }, [projectId, storageKey]);
+    if (projectId) writeStorage(projectKey, projectId);
+  }, [projectId, projectKey]);
 
-  const { board, setBoard, error, rpc } = useBoard(projectId);
+  const go = (nextProject: string, nextView: View) => {
+    if (nextView !== "settings") writeStorage(viewKey, nextView);
+    navigate.toPluginPanel("board", { subPath: `${nextProject}/${nextView}` });
+  };
+
+  // The open task lives in the URL, so a reload keeps it, a link can share
+  // it, and Back closes it.
+  const openTaskId = view !== "settings" && routeTaskKey === "task" && routeTaskId ? routeTaskId : null;
+  const openTaskRoute = (id: string | null, options: { replace?: boolean } = {}) => {
+    if (!projectId) return;
+    navigate.toPluginPanel("board", {
+      subPath: id ? `${projectId}/${view}/task/${id}` : `${projectId}/${view}`,
+      ...options,
+    });
+  };
+  const setOpenTaskId = (id: string | null) => openTaskRoute(id);
+
+  const { board, setBoard, error, rpc, refetch } = useBoard(projectId);
   const { threads } = experimental_useSidebarThreads();
   const activeThreads = useMemo(
     () => new Set(threads.filter((thread) => thread.status === "active").map((thread) => thread.id)),
     [threads],
   );
 
-  const [openTaskId, setOpenTaskId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [lessonsOpen, setLessonsOpen] = useState(false);
-  const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [dropTarget, setDropTarget] = useState<{ column: ColumnId; beforeId: string | null } | null>(null);
+
 
   const byColumn = useMemo(() => {
     const map = new Map<ColumnId, Task[]>(COLUMNS.map((column) => [column, []]));
     for (const task of board?.tasks ?? []) map.get(task.column)?.push(task);
     for (const cards of map.values()) cards.sort((a, b) => a.position - b.position);
-    const done = map.get("done");
-    if (done) done.sort((a, b) => (b.completedAt ?? b.updatedAt) - (a.completedAt ?? a.updatedAt));
+    map.get("done")?.sort((a, b) => (b.completedAt ?? b.updatedAt) - (a.completedAt ?? a.updatedAt));
     return map;
   }, [board]);
 
-  const running = board?.tasks.filter((task) => RUNNING_PHASES.has(task.phase) && task.phase !== "pr").length ?? 0;
+  const running =
+    board?.tasks.filter((task) => RUNNING_PHASES.has(task.phase) && task.phase !== "pr").length ?? 0;
   const openTask = board?.tasks.find((task) => task.id === openTaskId) ?? null;
+  const [measureRow, rowWidth] = useElementWidth<HTMLDivElement>();
+  const fill = rowWidth !== null && rowWidth < 960;
 
-  const onDragOverColumn = (event: DragEvent<HTMLElement>, column: ColumnId) => {
-    if (!event.dataTransfer.types.includes(DRAG_TYPE)) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
-    const card = (event.target as HTMLElement).closest<HTMLElement>("[data-task-id]");
-    let beforeId: string | null = null;
-    if (card) {
-      const rect = card.getBoundingClientRect();
-      const id = card.dataset.taskId ?? null;
-      if (event.clientY < rect.top + rect.height / 2) beforeId = id;
-      else {
-        const cards = byColumn.get(column) ?? [];
-        const index = cards.findIndex((task) => task.id === id);
-        beforeId = cards[index + 1]?.id ?? null;
+  // Esc closes the open task; Up and Down (or k and j) move through its column.
+  useEffect(() => {
+    if (!openTask) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, [contenteditable='true'], [role='dialog'], [role='menu']")) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        openTaskRoute(null);
+        return;
       }
-    }
-    if (dropTarget?.column !== column || dropTarget.beforeId !== beforeId) setDropTarget({ column, beforeId });
-  };
+      const step = event.key === "ArrowDown" || event.key === "j" ? 1 : event.key === "ArrowUp" || event.key === "k" ? -1 : 0;
+      if (step === 0) return;
+      const cards = byColumn.get(openTask.column) ?? [];
+      const next = cards[cards.findIndex((card) => card.id === openTask.id) + step];
+      if (!next) return;
+      event.preventDefault();
+      openTaskRoute(next.id, { replace: true });
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
-  const onDrop = (event: DragEvent<HTMLElement>, column: ColumnId) => {
-    const id = event.dataTransfer.getData(DRAG_TYPE);
-    const target = dropTarget;
-    setDropTarget(null);
-    setDraggingId(null);
-    if (!id || !board) return;
-    event.preventDefault();
-    const position = dropPosition(byColumn.get(column) ?? [], id, target?.column === column ? target.beforeId : null);
-    // Show the move at once; the server's answer replaces it.
-    setBoard({
-      ...board,
-      tasks: board.tasks.map((task) => (task.id === id ? { ...task, column, position } : task)),
-    });
-    void attempt(rpc.call("task_move", { id, column, position }));
-  };
-
-  if (projects === null) {
-    return <CenteredNote>Loading projects…</CenteredNote>;
-  }
+  if (projects === null) return <CenteredNote>Loading projects…</CenteredNote>;
   if (projects.length === 0 || !projectId) {
-    return (
-      <CenteredNote>
-        Shipyard needs a project with a git repository. Add one in bb, then come back.
-      </CenteredNote>
-    );
+    return <CenteredNote>Shipyard needs a project with a git repository. Add one in bb, then come back.</CenteredNote>;
   }
+  const projectName = projects.find((project) => project.id === projectId)?.name ?? "This project";
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
@@ -170,8 +140,8 @@ export function BoardPage({ subPath }: { subPath: string }) {
         <NativeSelect
           aria-label="Project"
           value={projectId}
-          onChange={(event) => navigate.toPluginPanel("board", { subPath: event.target.value })}
-          className="w-52"
+          onChange={(event) => go(event.target.value, view)}
+          className="w-48"
         >
           {projects.map((project) => (
             <option key={project.id} value={project.id}>
@@ -179,14 +149,25 @@ export function BoardPage({ subPath }: { subPath: string }) {
             </option>
           ))}
         </NativeSelect>
-        {board ? (
-          <span className="text-xs text-muted-foreground">
+        {view !== "settings" ? (
+          <Segmented<"board" | "list">
+            label="View"
+            value={view}
+            options={[
+              { value: "board", label: "Board", icon: "Columns2" },
+              { value: "list", label: "List", icon: "ListView" },
+            ]}
+            onChange={(next) => go(projectId, next)}
+          />
+        ) : null}
+        {board && view !== "settings" ? (
+          <span className="px-1 text-xs tabular-nums text-muted-foreground">
             {running} of {board.maxParallel} running
           </span>
         ) : null}
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex items-center gap-1">
           <Button size="sm" variant="ghost" onClick={() => setLessonsOpen(true)}>
-            <Icon name="Lightbulb" fallback="Star" className="size-4" />
+            <Icon name="Brain" className="size-4" />
             Lessons{board && board.lessons.length > 0 ? ` (${board.lessons.length})` : ""}
           </Button>
           <Button
@@ -196,18 +177,28 @@ export function BoardPage({ subPath }: { subPath: string }) {
               navigate.toCompose({
                 projectId,
                 focusPrompt: true,
-                initialPrompt:
-                  "Look at this project's Shipyard board with `bb shipyard list`, then help me with: ",
+                initialPrompt: "Look at this project's Shipyard board with `bb shipyard list`, then help me with: ",
               })
             }
           >
-            <Icon name="AiContentGenerator01" fallback="MessageCirclePlus" className="size-4" />
+            <Icon name="Bot" className="size-4" />
             Ask an agent
           </Button>
-          <Button size="sm" onClick={() => setCreating(true)}>
-            <Icon name="Plus" className="size-4" />
-            New task
+          <Button
+            size="sm"
+            variant="ghost"
+            aria-pressed={view === "settings"}
+            onClick={() => go(projectId, view === "settings" ? remembered : "settings")}
+          >
+            <Icon name="Settings" className="size-4" />
+            Settings
           </Button>
+          {view !== "settings" ? (
+            <Button size="sm" className="ml-1" onClick={() => setCreating(true)}>
+              <Icon name="Plus" className="size-4" />
+              New task
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -217,79 +208,43 @@ export function BoardPage({ subPath }: { subPath: string }) {
         </p>
       ) : null}
 
-      <div className="min-h-0 flex-1 overflow-x-auto overflow-y-hidden">
-        <div className="flex h-full min-w-fit gap-3 p-4 md:px-5">
-          {COLUMNS.map((column) => {
-            const cards = byColumn.get(column) ?? [];
-            const isTarget = dropTarget?.column === column;
-            return (
-              <section
-                key={column}
-                aria-label={COLUMN_LABELS[column]}
-                onDragOver={(event) => onDragOverColumn(event, column)}
-                onDragLeave={(event) => {
-                  if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null);
-                }}
-                onDrop={(event) => onDrop(event, column)}
-                className={cn(
-                  "flex h-full min-w-52 max-w-96 flex-1 basis-0 flex-col rounded-xl border border-transparent bg-muted/40 transition-colors",
-                  isTarget && "border-primary/40 bg-primary/5",
-                )}
-              >
-                <header className="px-3 pb-1 pt-3">
-                  <div className="flex h-6 items-center gap-2">
-                    <h2 className="text-sm font-medium text-foreground">{COLUMN_LABELS[column]}</h2>
-                    <span className="text-xs tabular-nums text-muted-foreground">{cards.length}</span>
-                    {column === "planning" ? (
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        className="ml-auto size-6 text-muted-foreground"
-                        aria-label="New task"
-                        onClick={() => setCreating(true)}
-                      >
-                        <Icon name="Plus" className="size-4" />
-                      </Button>
-                    ) : null}
-                  </div>
-                  {COLUMN_HINTS[column] ? (
-                    <p className="mt-0.5 text-xs text-muted-foreground">{COLUMN_HINTS[column]}</p>
-                  ) : null}
-                </header>
-                <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2">
-                  {board === null ? null : cards.length === 0 ? (
-                    <div className="rounded-lg border border-dashed border-border px-3 py-5 text-center text-xs text-muted-foreground">
-                      {column === "planning" ? "Add a task to get started." : "Drop a task here."}
-                    </div>
-                  ) : (
-                    cards.map((task) => (
-                      <div key={task.id} className="relative">
-                        {isTarget && dropTarget?.beforeId === task.id && draggingId !== task.id ? (
-                          <div aria-hidden className="absolute -top-1.5 left-1 right-1 h-0.5 rounded bg-primary" />
-                        ) : null}
-                        <TaskCard
-                          task={task}
-                          threadActive={task.threadId !== null && activeThreads.has(task.threadId)}
-                          dragging={draggingId === task.id}
-                          onOpen={() => setOpenTaskId(task.id)}
-                          onDragStart={() => setDraggingId(task.id)}
-                          onDragEnd={() => {
-                            setDraggingId(null);
-                            setDropTarget(null);
-                          }}
-                        />
-                      </div>
-                    ))
-                  )}
-                  {isTarget && dropTarget?.beforeId === null && cards.length > 0 ? (
-                    <div aria-hidden className="mx-1 h-0.5 rounded bg-primary" />
-                  ) : null}
-                </div>
-              </section>
-            );
-          })}
+      {view === "settings" ? (
+        <SettingsView
+          projectId={projectId}
+          projectName={projectName}
+          rpc={rpc}
+          onBack={() => go(projectId, remembered)}
+        />
+      ) : (
+        <div ref={measureRow} className="flex min-h-0 flex-1">
+          {/* On a narrow page (a small window or a split), the task takes the full width. */}
+          <div className={openTask && fill ? "hidden" : "flex min-w-0 flex-1 flex-col"}>
+            {view === "board" ? (
+              <BoardView
+                board={board}
+                byColumn={byColumn}
+                projectId={projectId}
+                rpc={rpc}
+                activeThreads={activeThreads}
+                selectedId={openTaskId}
+                onOpen={setOpenTaskId}
+                setBoard={setBoard}
+                refetch={refetch}
+              />
+            ) : (
+              <ListView rpc={rpc} byColumn={byColumn} activeThreads={activeThreads} selectedId={openTaskId} onOpen={setOpenTaskId} />
+            )}
+          </div>
+          <TaskPanel
+            fill={fill}
+            task={openTask}
+            projectId={projectId}
+            rpc={rpc}
+            threadActive={openTask?.threadId ? activeThreads.has(openTask.threadId) : false}
+            onClose={() => setOpenTaskId(null)}
+          />
         </div>
-      </div>
+      )}
 
       <NewTaskDialog open={creating} projectId={projectId} rpc={rpc} onClose={() => setCreating(false)} />
       <LessonsDialog
@@ -299,7 +254,6 @@ export function BoardPage({ subPath }: { subPath: string }) {
         rpc={rpc}
         onClose={() => setLessonsOpen(false)}
       />
-      <TaskDialog task={openTask} rpc={rpc} onClose={() => setOpenTaskId(null)} />
     </div>
   );
 }

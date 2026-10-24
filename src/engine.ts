@@ -1,57 +1,50 @@
 // The task pipeline. Each task owns one visible bb thread in its own git
-// worktree. The engine sends that thread one prompt per phase and advances
+// worktree. The engine sends that thread one prompt per stage and advances
 // the card when the thread goes idle:
 //
-//   queue → triage → implement → validate → human review
+//   ideas → (brainstorm, with the user) → queue
+//   queue → triage → (plan → (approval)) → implement → validate → human review
 //   human review → (request changes) revise → validate → human review
 //   human review → create PR → merge → done
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import {
   type ColumnId,
+  type DoneInput,
   type Effort,
   EFFORTS,
   type Phase,
+  type PlanMode,
   type Report,
   RUNNING_PHASES,
+  type ShipyardSettings,
+  type Stage,
+  type StageSkills,
   type TaskAction,
   type Tier,
   type Triage,
   type TriageInput,
 } from "./model";
 import {
+  answerPrompt,
+  brainstormPrompt,
   continuePrompt,
   implementPrompt,
+  planPrompt,
   pullRequestPrompt,
   resolveConflictsPrompt,
+  revisePlanPrompt,
   revisePrompt,
   triagePrompt,
   validatePrompt,
+  withSkills,
 } from "./prompts";
-import { type StoredTask, type Store } from "./store";
-
-export interface ShipyardSettings {
-  maxParallel: number;
-  providerId: string;
-  triage: boolean;
-  allowHardest: boolean;
-  planning: "auto" | "always" | "never";
-  validation: boolean;
-  permissionMode: "full" | "auto" | "accept-edits";
-  baseBranch: string;
-  mergeMethod: "squash" | "merge" | "rebase";
-  archiveOnDone: boolean;
-}
+import type { Settings } from "./settings";
+import { type StoredTask, type Store, type TaskPatch } from "./store";
 
 export const BOARD_CHANGED = "board-changed";
 
-/** Phases that hold one of the project's parallel slots. */
-const SLOT_PHASES: readonly Phase[] = [
-  "triage",
-  "implement",
-  "validate",
-  "revise",
-  "merge_fix",
-];
+/** Phases that hold one of the project's parallel slots. Brainstorm waits for a person, so it holds none. */
+const SLOT_PHASES: readonly Phase[] = ["triage", "plan", "implement", "validate", "revise", "merge_fix"];
 
 const TIER_FAMILIES: Record<Tier, string> = {
   light: "haiku",
@@ -60,7 +53,18 @@ const TIER_FAMILIES: Record<Tier, string> = {
   hardest: "fable",
 };
 
+/** The stage whose skills load when a stopped phase resumes. */
+const STAGE_OF_PHASE: Partial<Record<Phase, Stage>> = {
+  plan: "plan",
+  implement: "implement",
+  revise: "revise",
+  validate: "validate",
+  pr: "pr",
+  merge_fix: "implement",
+};
+
 const MAX_RATE_LIMIT_RETRIES = 5;
+const MAX_PLAN_CHARS = 20_000;
 
 type Sdk = BbPluginApi["sdk"];
 
@@ -69,6 +73,11 @@ interface ModelInfo {
   isDefault: boolean;
   efforts: string[];
   defaultEffort: string;
+}
+
+interface Execution {
+  model?: string | null;
+  reasoningLevel?: string | null;
 }
 
 function errorMessage(error: unknown): string {
@@ -80,6 +89,21 @@ function firstLine(text: string, max: number): string {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
+function fallbackTriage(task: StoredTask, source: "off" | "fallback", reasoning: string): Triage {
+  return {
+    tier: "standard",
+    effort: "medium",
+    needsPlan: false,
+    scope: "medium",
+    title: task.title,
+    reasoning,
+    verification: [],
+    model: null,
+    reasoningLevel: null,
+    source,
+  };
+}
+
 export class Engine {
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly modelCache = new Map<string, { at: number; models: ModelInfo[] }>();
@@ -89,7 +113,7 @@ export class Engine {
   constructor(
     private readonly bb: BbPluginApi,
     private readonly store: Store,
-    private readonly settings: () => Promise<ShipyardSettings>,
+    private readonly settings: Settings,
   ) {}
 
   private get sdk(): Sdk {
@@ -107,12 +131,16 @@ export class Engine {
     return next;
   }
 
-  private changed(projectId: string): void {
+  changed(projectId: string | null): void {
     this.bb.realtime.publish(BOARD_CHANGED, { projectId });
   }
 
   private log(task: StoredTask, kind: "info" | "success" | "warning" | "error", message: string): void {
     this.store.addEvent(task.id, kind, message);
+  }
+
+  private settingsFor(task: StoredTask): ShipyardSettings {
+    return this.settings.effective(task.projectId);
   }
 
   // ---------------------------------------------------------------------
@@ -123,7 +151,9 @@ export class Engine {
     projectId: string;
     title?: string;
     description: string;
-    start: boolean;
+    destination: "ideas" | "brainstorm" | "queue";
+    planMode?: PlanMode;
+    stageSkills?: StageSkills;
   }): Promise<StoredTask> {
     const title = input.title?.trim() ?? "";
     const task = this.store.insertTask({
@@ -131,21 +161,29 @@ export class Engine {
       title: title || firstLine(input.description, 80) || "Untitled task",
       titleAuto: title === "",
       description: input.description.trim(),
-      column: input.start ? "queue" : "planning",
+      column: input.destination === "queue" ? "queue" : "ideas",
+      planMode: input.planMode ?? "auto",
+      stageSkills: input.stageSkills ?? {},
     });
-    this.log(task, "info", input.start ? "Created and queued" : "Created");
+    this.log(task, "info", input.destination === "queue" ? "Created and queued" : "Created");
     this.changed(task.projectId);
-    if (input.start) this.pump();
+    if (input.destination === "brainstorm") return this.moveTask(task.id, "brainstorm");
+    if (input.destination === "queue") this.pump();
     return task;
   }
 
-  async editTask(id: string, patch: { title?: string; description?: string }): Promise<StoredTask> {
+  async editTask(
+    id: string,
+    patch: { title?: string; description?: string; planMode?: PlanMode; stageSkills?: StageSkills },
+  ): Promise<StoredTask> {
     return this.withLock(id, async () => {
       const task = this.requireTask(id);
       const title = patch.title?.trim();
       const updated = this.store.updateTask(id, {
         ...(title ? { title, titleAuto: false } : {}),
         ...(patch.description !== undefined ? { description: patch.description.trim() } : {}),
+        ...(patch.planMode ? { planMode: patch.planMode } : {}),
+        ...(patch.stageSkills ? { stageSkills: patch.stageSkills } : {}),
       });
       if (title && task.threadId) {
         await this.sdk.threads.update({ threadId: task.threadId, title }).catch(() => undefined);
@@ -179,16 +217,18 @@ export class Engine {
         return this.store.updateTask(id, { position: pos });
       }
       switch (column) {
-        case "planning":
-          await this.haltIfRunning(task, "Moved back to Planning");
+        case "ideas":
+          await this.haltIfRunning(task, "Moved back to Ideas");
           return this.store.updateTask(id, {
             column,
             position: pos,
             phase: "idle",
             reviewReason: null,
-            note: null,
             error: null,
           });
+        case "brainstorm":
+          await this.haltIfRunning(task, "Moved to Brainstorm");
+          return this.startBrainstorm(this.store.updateTask(id, { position: pos }));
         case "queue":
           await this.haltIfRunning(task, "Moved to the queue");
           this.log(task, "info", "Queued");
@@ -198,24 +238,18 @@ export class Engine {
             phase: "queued",
             reviewReason: null,
             error: null,
-            note: null,
           });
         case "in_progress":
-          await this.haltIfRunning(task, "Restarted from In Progress");
+          await this.haltIfRunning(task, "Started from In Progress");
           this.store.updateTask(id, { position: pos });
           return this.begin(this.requireTask(id));
-        case "ai_review":
-          await this.haltIfRunning(task, "Moved to AI Review");
-          this.store.updateTask(id, { position: pos });
-          if (!task.threadId) return this.begin(this.requireTask(id));
-          return this.runValidation(this.requireTask(id));
         case "human_review": {
           const wasRunning = await this.haltIfRunning(task, "Moved to Human Review");
           return this.store.updateTask(id, {
             column,
             position: pos,
             phase: "review",
-            reviewReason: wasRunning ? "stopped" : task.reviewReason ?? "completed",
+            reviewReason: wasRunning ? "stopped" : task.reviewReason ?? (task.triage ? "completed" : null),
           });
         }
         case "done":
@@ -233,7 +267,7 @@ export class Engine {
       const task = this.requireTask(id);
       switch (action) {
         case "start":
-          if (task.column === "planning") {
+          if (task.column === "ideas" || task.column === "brainstorm") {
             this.log(task, "info", "Queued");
             return this.store.updateTask(id, {
               column: "queue",
@@ -245,15 +279,16 @@ export class Engine {
           }
           await this.haltIfRunning(task, "Restarted");
           return this.begin(this.requireTask(id));
+        case "approve_plan":
+          if (task.reviewReason !== "plan_ready" || task.column !== "human_review" || RUNNING_PHASES.has(task.phase)) {
+            throw new Error("This task has no plan waiting for approval.");
+          }
+          this.log(task, "success", "Plan approved");
+          return this.implement(task, { afterPlan: true });
         case "stop":
           if (!task.threadId || !RUNNING_PHASES.has(task.phase)) return task;
           await this.haltIfRunning(task, "Stopped by the user");
-          return this.store.updateTask(id, {
-            column: "human_review",
-            position: this.store.endPosition(task.projectId, "human_review"),
-            phase: "review",
-            reviewReason: "stopped",
-          });
+          return this.toHumanReview(this.requireTask(id), "stopped");
         case "retry_validation":
           if (!task.threadId) throw new Error("This task has no agent thread yet.");
           await this.haltIfRunning(task, "Validation restarted");
@@ -283,18 +318,52 @@ export class Engine {
       const task = this.requireTask(id);
       const text = feedback.trim();
       if (!text) throw new Error("Describe the changes you want.");
-      this.log(task, "info", `Changes requested: ${firstLine(text, 160)}`);
-      if (startOver || !task.threadId) {
-        // The notes go into the description so every phase of the new
-        // attempt, triage included, sees them.
-        const reset = await this.discard(task);
-        const withNotes = this.store.updateTask(reset.id, {
-          description: `${reset.description}\n\nNotes from a discarded attempt:\n${text}`.trim(),
-        });
-        return this.begin(withNotes);
+      if (task.column !== "human_review" || RUNNING_PHASES.has(task.phase)) {
+        throw new Error("You can request changes only on a task in Human Review.");
       }
-      const settings = await this.settings();
-      await this.send(task, revisePrompt(text, task.triage), settings);
+      if (!startOver && task.threadId && !task.triage) {
+        throw new Error("This task has not run yet. Queue it instead.");
+      }
+      const answering = (task.reviewReason === "blocked" || task.reviewReason === "needs_input") && task.signal !== null;
+      this.log(task, "info", `${answering ? "Answer sent" : "Changes requested"}: ${firstLine(text, 160)}`);
+      if (startOver || !task.threadId) {
+        // The notes go into the description so every stage of the new
+        // attempt, triage included, sees them. The attempt waits for a slot.
+        const reset = await this.discard(task);
+        this.log(reset, "info", "Queued a new attempt");
+        return this.store.updateTask(reset.id, {
+          description: `${reset.description}\n\nNotes from a discarded attempt:\n${text}`.trim(),
+          column: "queue",
+          position: this.store.endPosition(reset.projectId, "queue"),
+          phase: "queued",
+        });
+      }
+      const settings = this.settingsFor(task);
+      if ((task.reviewReason === "blocked" || task.reviewReason === "needs_input") && task.signal) {
+        // Resume the stage that stopped, in the same session.
+        const phase = task.signal.phase;
+        const stage = STAGE_OF_PHASE[phase];
+        const skills = stage ? this.settings.skillsFor(task, stage) : [];
+        await this.send(task, withSkills(skills, answerPrompt(text)), settings);
+        return this.store.updateTask(id, {
+          column: "in_progress",
+          position: this.store.endPosition(task.projectId, "in_progress"),
+          phase,
+          reviewReason: null,
+          error: null,
+        });
+      }
+      if (task.reviewReason === "plan_ready") {
+        await this.send(task, withSkills(this.settings.skillsFor(task, "plan"), revisePlanPrompt(text)), settings);
+        return this.store.updateTask(id, {
+          column: "in_progress",
+          position: this.store.endPosition(task.projectId, "in_progress"),
+          phase: "plan",
+          reviewReason: null,
+          error: null,
+        });
+      }
+      await this.send(task, withSkills(this.settings.skillsFor(task, "revise"), revisePrompt(text, task.triage)), settings);
       return this.store.updateTask(id, {
         column: "in_progress",
         position: this.store.endPosition(task.projectId, "in_progress"),
@@ -302,7 +371,6 @@ export class Engine {
         reviewReason: null,
         report: null,
         error: null,
-        note: null,
         mergeAttempts: 0,
       });
     });
@@ -342,8 +410,8 @@ export class Engine {
   }
 
   private async pumpOnce(): Promise<void> {
-    const settings = await this.settings();
     for (const projectId of this.store.projectIdsWithQueue()) {
+      const { maxParallel } = this.settings.effective(projectId);
       const queued = this.store
         .listTasks(projectId)
         .filter((task) => task.phase === "queued" && task.column === "queue")
@@ -353,8 +421,8 @@ export class Engine {
         const running = this.store
           .listTasks(projectId)
           .filter((other) => SLOT_PHASES.includes(other.phase)).length;
-        if (running >= settings.maxParallel) {
-          const note = `Waiting for a free slot (${running} of ${settings.maxParallel} running)`;
+        if (running >= maxParallel) {
+          const note = `Waiting for a free slot (${running} of ${maxParallel} running)`;
           if (task.note !== note) {
             this.store.updateTask(task.id, { note });
             this.changed(projectId);
@@ -375,87 +443,181 @@ export class Engine {
   // Pipeline steps
   // ---------------------------------------------------------------------
 
-  /** Start a task, or continue it in its existing thread. */
-  private async begin(task: StoredTask): Promise<StoredTask> {
-    const settings = await this.settings();
-    const base = {
-      column: "in_progress" as const,
-      position: this.store.endPosition(task.projectId, "in_progress"),
-      reviewReason: null,
-      error: null,
-      note: null,
-      startedAt: task.startedAt ?? Date.now(),
-    };
+  /** Open the brainstorm in the task's thread; a new thread when it has none. */
+  private async startBrainstorm(task: StoredTask): Promise<StoredTask> {
+    const settings = this.settingsFor(task);
+    const prompt = withSkills(
+      this.settings.skillsFor(task, "brainstorm"),
+      brainstormPrompt(task, { revisit: task.threadId !== null }),
+    );
     try {
-      if (task.threadId) {
-        await this.send(task, continuePrompt(task), settings);
-        this.log(task, "info", "Continuing in the existing thread");
-        return this.store.updateTask(task.id, { ...base, phase: "implement" });
-      }
-      const providerId = await this.resolveProvider(task.projectId, settings);
-      if (settings.triage) {
-        const models = providerId ? await this.models(task.projectId, providerId) : [];
-        const triageModel = this.pickModel(models, providerId, "light");
-        const thread = await this.spawn(task, settings, {
-          providerId,
-          prompt: triagePrompt(task, settings.allowHardest),
-          model: triageModel?.model,
-          reasoningLevel: triageModel ? this.pickEffort(triageModel, "low") : undefined,
-        });
-        this.log(task, "info", "Triage started");
-        return this.store.updateTask(task.id, {
-          ...base,
-          phase: "triage",
-          threadId: thread.id,
-          environmentId: thread.environmentId,
-          triage: null,
-          report: null,
-        });
-      }
-      const triage: Triage = {
-        tier: "standard",
-        effort: "medium",
-        needsPlan: settings.planning === "always",
-        scope: "medium",
-        title: task.title,
-        reasoning: "Triage is off; the provider's default model runs the task.",
-        verification: [],
-        model: null,
-        reasoningLevel: null,
-        source: "off",
-      };
-      const withTriage = this.store.updateTask(task.id, { triage });
-      const thread = await this.spawn(withTriage, settings, {
-        providerId,
-        prompt: implementPrompt(withTriage, { includeTask: true }),
-      });
-      this.log(task, "info", "Implementation started");
+      const spawned = await this.dispatch(task, settings, prompt);
+      this.log(task, "info", "Brainstorm started");
       return this.store.updateTask(task.id, {
-        ...base,
-        phase: "implement",
-        threadId: thread.id,
-        environmentId: thread.environmentId,
+        ...spawned,
+        column: "brainstorm",
+        phase: "brainstorm",
+        reviewReason: null,
+        error: null,
+        triage: null,
+        plan: null,
         report: null,
+        reached: null,
       });
     } catch (error) {
-      this.log(task, "error", `Could not start: ${errorMessage(error)}`);
-      return this.store.updateTask(task.id, {
-        column: "human_review",
-        position: this.store.endPosition(task.projectId, "human_review"),
-        phase: "review",
-        reviewReason: "errors",
-        error: errorMessage(error),
-      });
+      this.log(task, "error", `Could not start the brainstorm: ${errorMessage(error)}`);
+      return this.store.updateTask(task.id, { column: "ideas", phase: "idle", error: errorMessage(error) });
     }
   }
 
-  private async spawn(
+  /** Start a task: triage, or the first build stage when triage is off. */
+  private async begin(task: StoredTask): Promise<StoredTask> {
+    const settings = this.settingsFor(task);
+    const base: TaskPatch = {
+      column: "in_progress",
+      position: this.store.endPosition(task.projectId, "in_progress"),
+      reviewReason: null,
+      error: null,
+      startedAt: task.startedAt ?? Date.now(),
+    };
+    try {
+      // A task with a triage resumes in its thread from the furthest stage it started.
+      if (task.threadId && task.triage) {
+        if (task.reached === "implement") {
+          await this.send(task, withSkills(this.settings.skillsFor(task, "implement"), continuePrompt(task)), settings);
+          this.log(task, "info", "Continuing in the existing thread");
+          return this.store.updateTask(task.id, { ...base, phase: "implement" });
+        }
+        if (task.reached === "plan" && task.plan) {
+          if (settings.planApproval) {
+            this.log(task, "info", "The plan still waits for your approval");
+            return this.toHumanReview(task, "plan_ready");
+          }
+          return this.implement(this.store.updateTask(task.id, base), { afterPlan: true });
+        }
+        return this.startBuild(this.store.updateTask(task.id, base));
+      }
+      if (settings.triage) {
+        const providerId = await this.threadProvider(task, settings);
+        const models = providerId ? await this.models(task.projectId, providerId) : [];
+        const triageModel = this.pickModel(models, providerId, "light");
+        const spawned = await this.dispatch(
+          task,
+          settings,
+          withSkills(this.settings.skillsFor(task, "triage"), triagePrompt(task, settings.allowHardest)),
+          {
+            model: triageModel?.model,
+            reasoningLevel: triageModel ? this.pickEffort(triageModel, "low") : undefined,
+          },
+          providerId,
+        );
+        this.log(task, "info", "Triage started");
+        return this.store.updateTask(task.id, {
+          ...base,
+          ...spawned,
+          phase: "triage",
+          triage: null,
+          report: null,
+          plan: null,
+          reached: null,
+        });
+      }
+      const withTriage = this.store.updateTask(task.id, {
+        ...base,
+        triage: fallbackTriage(task, "off", "Triage is off; the provider's default model runs the task."),
+        report: null,
+        plan: null,
+        reached: null,
+      });
+      return this.startBuild(withTriage);
+    } catch (error) {
+      this.log(task, "error", `Could not start: ${errorMessage(error)}`);
+      return this.toHumanReview(task, "errors", { error: errorMessage(error) });
+    }
+  }
+
+  /** Whether this task plans first: the task's choice, then the setting, then triage. */
+  private needsPlan(task: StoredTask, settings: ShipyardSettings): boolean {
+    if (task.planMode === "always") return true;
+    if (task.planMode === "skip") return false;
+    if (settings.planning === "always") return true;
+    if (settings.planning === "never") return false;
+    return task.triage?.needsPlan ?? false;
+  }
+
+  /** After triage: plan first, or implement. */
+  private async startBuild(task: StoredTask): Promise<StoredTask> {
+    const settings = this.settingsFor(task);
+    if (!this.needsPlan(task, settings)) return this.implement(task, { afterPlan: false });
+    const spawned = await this.dispatch(
+      task,
+      settings,
+      withSkills(
+        this.settings.skillsFor(task, "plan"),
+        planPrompt(task, { includeTask: task.threadId === null, commitPlans: settings.commitPlans }),
+      ),
+      this.executionFor(task),
+    );
+    this.log(task, "info", "Planning started");
+    return this.store.updateTask(task.id, {
+      ...spawned,
+      column: "in_progress",
+      phase: "plan",
+      reviewReason: null,
+      plan: null,
+      reached: "plan",
+    });
+  }
+
+  private async implement(task: StoredTask, opts: { afterPlan: boolean }): Promise<StoredTask> {
+    const settings = this.settingsFor(task);
+    const spawned = await this.dispatch(
+      task,
+      settings,
+      withSkills(
+        this.settings.skillsFor(task, "implement"),
+        implementPrompt(task, {
+          includeTask: task.threadId === null,
+          afterPlan: opts.afterPlan,
+          commitPlans: settings.commitPlans,
+        }),
+      ),
+      this.executionFor(task),
+    );
+    this.log(task, "info", "Build started");
+    return this.store.updateTask(task.id, {
+      ...spawned,
+      column: "in_progress",
+      position: task.column === "in_progress" ? task.position : this.store.endPosition(task.projectId, "in_progress"),
+      phase: "implement",
+      reviewReason: null,
+      report: null,
+      reached: "implement",
+    });
+  }
+
+  private executionFor(task: StoredTask): Execution {
+    return { model: task.triage?.model, reasoningLevel: task.triage?.reasoningLevel };
+  }
+
+  /**
+   * Send a prompt to the task's thread, or spawn the thread with it. Returns
+   * the fields to store when it spawned one.
+   */
+  private async dispatch(
     task: StoredTask,
     settings: ShipyardSettings,
-    opts: { providerId: string | null; prompt: string; model?: string; reasoningLevel?: string },
-  ) {
+    prompt: string,
+    execution: Execution = {},
+    providerId?: string | null,
+  ): Promise<TaskPatch> {
+    if (task.threadId) {
+      await this.send(task, prompt, settings, execution);
+      return {};
+    }
     const hostId = await this.projectHost(task.projectId);
-    return this.sdk.threads.spawn({
+    const provider = providerId === undefined ? await this.resolveProvider(task.projectId, settings) : providerId;
+    const thread = await this.sdk.threads.spawn({
       projectId: task.projectId,
       title: task.title,
       environment: {
@@ -463,26 +625,20 @@ export class Engine {
         hostId,
         workspace: {
           type: "managed-worktree",
-          baseBranch: settings.baseBranch
-            ? { kind: "named", name: settings.baseBranch }
-            : { kind: "default" },
+          baseBranch: settings.baseBranch ? { kind: "named", name: settings.baseBranch } : { kind: "default" },
         },
       },
-      prompt: opts.prompt,
+      prompt,
       permissionMode: settings.permissionMode,
-      ...(opts.providerId ? { providerId: opts.providerId } : {}),
-      ...(opts.model ? { model: opts.model } : {}),
-      ...(opts.reasoningLevel ? { reasoningLevel: opts.reasoningLevel } : {}),
+      ...(provider ? { providerId: provider } : {}),
+      ...(execution.model ? { model: execution.model } : {}),
+      ...(execution.reasoningLevel ? { reasoningLevel: execution.reasoningLevel } : {}),
       pluginMetadata: { taskId: task.id },
     });
+    return { threadId: thread.id, environmentId: thread.environmentId };
   }
 
-  private async send(
-    task: StoredTask,
-    text: string,
-    settings: ShipyardSettings,
-    execution?: { model?: string | null; reasoningLevel?: string | null },
-  ): Promise<void> {
+  private async send(task: StoredTask, text: string, settings: ShipyardSettings, execution: Execution = {}): Promise<void> {
     if (!task.threadId) throw new Error("This task has no agent thread.");
     const thread = await this.sdk.threads.get({ threadId: task.threadId });
     if (thread.archivedAt !== null) {
@@ -493,40 +649,42 @@ export class Engine {
       mode: "queue-if-active",
       input: [{ type: "text", text, mentions: [] }],
       permissionMode: settings.permissionMode,
-      ...(execution?.model ? { model: execution.model } : {}),
-      ...(execution?.reasoningLevel ? { reasoningLevel: execution.reasoningLevel } : {}),
+      ...(execution.model ? { model: execution.model } : {}),
+      ...(execution.reasoningLevel ? { reasoningLevel: execution.reasoningLevel } : {}),
     });
   }
 
   private async runValidation(task: StoredTask): Promise<StoredTask> {
-    const settings = await this.settings();
+    const settings = this.settingsFor(task);
     const baseBranch = await this.baseBranchFor(task, settings);
-    await this.send(task, validatePrompt(task, baseBranch), settings);
+    await this.send(task, withSkills(this.settings.skillsFor(task, "validate"), validatePrompt(task, baseBranch)), settings);
     this.log(task, "info", "Validation started");
     return this.store.updateTask(task.id, {
-      column: "ai_review",
-      position: this.store.endPosition(task.projectId, "ai_review"),
+      column: "in_progress",
+      position: task.column === "in_progress" ? task.position : this.store.endPosition(task.projectId, "in_progress"),
       phase: "validate",
       reviewReason: null,
       report: null,
       error: null,
-      note: null,
     });
   }
 
-  private toHumanReview(task: StoredTask, reason: "completed" | "qa_rejected" | "errors" | "stopped", extra: { error?: string | null } = {}): StoredTask {
+  private toHumanReview(
+    task: StoredTask,
+    reason: "completed" | "qa_rejected" | "errors" | "stopped" | "plan_ready" | "blocked" | "needs_input",
+    extra: { error?: string | null } = {},
+  ): StoredTask {
     return this.store.updateTask(task.id, {
       column: "human_review",
       position: this.store.endPosition(task.projectId, "human_review"),
       phase: "review",
       reviewReason: reason,
-      note: null,
       ...extra,
     });
   }
 
   private async finish(task: StoredTask, position: number, reason: "merged" | null): Promise<StoredTask> {
-    const settings = await this.settings();
+    const settings = this.settingsFor(task);
     if (settings.archiveOnDone && task.threadId) {
       await this.sdk.threads.archive({ threadId: task.threadId }).catch((error: unknown) => {
         this.log(task, "warning", `Could not archive the thread: ${errorMessage(error)}`);
@@ -537,8 +695,8 @@ export class Engine {
       column: "done",
       position,
       phase: "done",
-      reviewReason: reason ?? task.reviewReason,
-      note: null,
+      // A plan that waited for approval is no longer pending once the task is done.
+      reviewReason: reason ?? (task.reviewReason === "plan_ready" ? null : task.reviewReason),
       completedAt: Date.now(),
     });
   }
@@ -552,17 +710,18 @@ export class Engine {
     }
     this.log(task, "warning", "Attempt discarded");
     return this.store.updateTask(task.id, {
-      column: "planning",
-      position: this.store.endPosition(task.projectId, "planning"),
+      column: "ideas",
+      position: this.store.endPosition(task.projectId, "ideas"),
       phase: "idle",
       reviewReason: null,
       error: null,
-      note: null,
       threadId: null,
       environmentId: null,
       branch: null,
       triage: null,
       report: null,
+      plan: null,
+      reached: null,
       pullRequest: null,
       changedFiles: [],
       mergeAttempts: 0,
@@ -573,7 +732,7 @@ export class Engine {
 
   private async createPullRequest(task: StoredTask): Promise<StoredTask> {
     if (!task.threadId) throw new Error("Start the task before you open a pull request.");
-    const settings = await this.settings();
+    const settings = this.settingsFor(task);
     const existing = await this.fetchPullRequest(task);
     if (existing) {
       return this.store.updateTask(task.id, {
@@ -583,9 +742,13 @@ export class Engine {
         mergeAttempts: 0,
       });
     }
-    await this.send(task, pullRequestPrompt(task, await this.baseBranchFor(task, settings)), settings);
+    await this.send(
+      task,
+      withSkills(this.settings.skillsFor(task, "pr"), pullRequestPrompt(task, await this.baseBranchFor(task, settings))),
+      settings,
+    );
     this.log(task, "info", "Asked the agent to open a pull request");
-    return this.store.updateTask(task.id, { phase: "pr", note: null, error: null, mergeAttempts: 0 });
+    return this.store.updateTask(task.id, { phase: "pr", error: null, mergeAttempts: 0 });
   }
 
   private async refreshPullRequest(task: StoredTask): Promise<StoredTask> {
@@ -603,7 +766,7 @@ export class Engine {
 
   private async merge(task: StoredTask): Promise<StoredTask> {
     if (!task.environmentId) throw new Error("This task has no workspace to merge.");
-    const settings = await this.settings();
+    const settings = this.settingsFor(task);
     const pr = await this.fetchPullRequest(task);
     if (!pr) throw new Error("Open a pull request first.");
     try {
@@ -617,10 +780,7 @@ export class Engine {
       if (pr.attention === "conflicts" && task.mergeAttempts < 1) {
         return this.resolveConflicts(task, true);
       }
-      return this.store.updateTask(task.id, {
-        pullRequest: pr,
-        error: `Merge failed: ${message}`,
-      });
+      return this.store.updateTask(task.id, { pullRequest: pr, error: `Merge failed: ${message}` });
     }
     return this.finish(
       this.store.updateTask(task.id, { pullRequest: { ...pr, attention: "merged" }, error: null }),
@@ -631,7 +791,7 @@ export class Engine {
 
   /** Ask the agent to merge the base branch in; with retry, merge again after. */
   private async resolveConflicts(task: StoredTask, retryMerge: boolean): Promise<StoredTask> {
-    const settings = await this.settings();
+    const settings = this.settingsFor(task);
     await this.send(task, resolveConflictsPrompt(await this.baseBranchFor(task, settings), task.triage), settings);
     this.log(task, "info", "Asked the agent to resolve merge conflicts");
     return this.store.updateTask(task.id, {
@@ -664,51 +824,78 @@ export class Engine {
   async recordTriage(threadId: string, input: TriageInput): Promise<string> {
     const task = await this.taskForTool(threadId);
     if (!task) return "This thread is not a Shipyard task. Nothing was recorded.";
-    {
-      const settings = await this.settings();
-      const fresh = this.requireTask(task.id);
-      const tier: Tier = !settings.allowHardest && input.tier === "hardest" ? "deep" : input.tier;
-      const providerId = await this.threadProvider(fresh, settings);
-      const models = providerId ? await this.models(fresh.projectId, providerId) : [];
-      const model = this.pickModel(models, providerId, tier);
-      const triage: Triage = {
-        ...input,
-        tier,
-        needsPlan:
-          settings.planning === "always" ? true : settings.planning === "never" ? false : input.needsPlan,
-        model: model?.model ?? null,
-        reasoningLevel: (model ? this.pickEffort(model, input.effort) : null) ?? null,
-        source: "auto",
-      };
-      const patch: Parameters<Store["updateTask"]>[1] = { triage };
-      if (fresh.titleAuto && input.title) {
-        patch.title = input.title;
-        await this.sdk.threads.update({ threadId, title: input.title }).catch(() => undefined);
-      }
-      this.store.updateTask(fresh.id, patch);
-      this.log(
-        fresh,
-        "info",
-        `Triage: ${tier}${triage.model ? ` (${triage.model})` : ""}, ${input.effort} effort, ${triage.needsPlan ? "with a plan" : "no plan"}. ${input.reasoning}`,
-      );
-      this.changed(fresh.projectId);
-      return "Triage recorded. Stop now; Shipyard starts the implementation next.";
+    if (task.phase !== "triage") return "Shipyard records a triage only during the triage stage. Nothing was recorded.";
+    const settings = this.settingsFor(task);
+    const tier: Tier = !settings.allowHardest && input.tier === "hardest" ? "deep" : input.tier;
+    const providerId = await this.threadProvider(task, settings);
+    const models = providerId ? await this.models(task.projectId, providerId) : [];
+    const model = this.pickModel(models, providerId, tier);
+    const triage: Triage = {
+      ...input,
+      tier,
+      model: model?.model ?? null,
+      reasoningLevel: (model ? this.pickEffort(model, input.effort) : null) ?? null,
+      source: "auto",
+    };
+    const patch: TaskPatch = { triage };
+    if (task.titleAuto && input.title) {
+      patch.title = input.title;
+      await this.sdk.threads.update({ threadId, title: input.title }).catch(() => undefined);
     }
+    const updated = this.store.updateTask(task.id, patch);
+    this.log(
+      task,
+      "info",
+      `Triage: ${tier}${triage.model ? ` (${triage.model})` : ""}, ${input.effort} effort, ${this.needsPlan(updated, settings) ? "plan first" : "no plan"}. ${input.reasoning}`,
+    );
+    this.changed(task.projectId);
+    return "Triage recorded. Stop now; Shipyard starts the next stage.";
   }
 
   async recordReport(threadId: string, report: Report): Promise<string> {
     const task = await this.taskForTool(threadId);
     if (!task) return "This thread is not a Shipyard task. Nothing was recorded.";
-    {
-      this.store.updateTask(task.id, { report });
-      this.log(
-        task,
-        report.status === "failed" ? "error" : report.status === "partial" ? "warning" : "success",
-        `Validation ${report.status}: ${firstLine(report.summary, 200)}`,
-      );
-      this.changed(task.projectId);
-      return "Report recorded. Stop now; the task goes to human review.";
+    this.store.updateTask(task.id, { report });
+    this.log(
+      task,
+      report.status === "failed" ? "error" : report.status === "partial" ? "warning" : "success",
+      `Validation ${report.status}: ${firstLine(report.summary, 200)}`,
+    );
+    this.changed(task.projectId);
+    return "Report recorded. Stop now; the task goes to human review.";
+  }
+
+  async recordSpec(threadId: string, input: { title?: string; spec: string }): Promise<string> {
+    const task = await this.taskForTool(threadId);
+    if (!task) return "This thread is not a Shipyard task. Nothing was recorded.";
+    if (task.phase !== "brainstorm") return "The spec can change only while the task is in Brainstorm.";
+    const title = input.title?.trim();
+    this.store.updateTask(task.id, {
+      description: input.spec.trim(),
+      ...(title ? { title, titleAuto: false } : {}),
+    });
+    if (title) await this.sdk.threads.update({ threadId, title }).catch(() => undefined);
+    this.log(task, "success", `Spec saved. The earlier description was: ${firstLine(task.description || task.title, 300)}`);
+    this.changed(task.projectId);
+    return 'Spec saved on the card. Tell the user to choose "Queue it" or "Save for later".';
+  }
+
+  async recordDone(threadId: string, input: DoneInput): Promise<string> {
+    const task = await this.taskForTool(threadId);
+    if (!task) return "This thread is not a Shipyard task. Nothing was recorded.";
+    if (!RUNNING_PHASES.has(task.phase) || task.phase === "triage") {
+      return "No Shipyard build stage is running in this thread. Nothing was recorded.";
     }
+    this.store.updateTask(task.id, { signal: { ...input, phase: task.phase, at: Date.now() } });
+    this.log(
+      task,
+      input.status === "done" ? "info" : "warning",
+      `${input.status === "done" ? "Stage done" : input.status === "blocked" ? "Blocked" : "Needs input"}: ${firstLine(input.summary, 200)}`,
+    );
+    this.changed(task.projectId);
+    return input.status === "done"
+      ? "Recorded. End your turn now; Shipyard starts the next stage."
+      : "Recorded. End your turn now; the task waits for the user's answer.";
   }
 
   async recordLesson(threadId: string, text: string): Promise<string> {
@@ -747,35 +934,45 @@ export class Engine {
   private async advance(taskId: string): Promise<void> {
     const task = this.store.getTask(taskId);
     if (!task || !RUNNING_PHASES.has(task.phase) || !task.threadId) return;
-    const settings = await this.settings();
+    const settings = this.settingsFor(task);
     await this.refreshWorkspace(task);
     const current = this.requireTask(taskId);
+    // The agent's own signal decides whether the stage ended; idle alone is
+    // the fallback for an agent that did not call shipyard_done.
+    const signal = current.signal?.phase === current.phase ? current.signal : null;
+    if (signal && signal.status !== "done") {
+      this.toHumanReview(current, signal.status);
+      return;
+    }
+    if (!signal && current.phase !== "triage" && current.phase !== "validate") {
+      this.log(current, "info", "The agent ended the stage without shipyard_done; Shipyard treats it as done");
+    }
     try {
       switch (current.phase) {
         case "triage": {
-          let triage = current.triage;
-          if (!triage) {
+          let ready = current;
+          if (!current.triage) {
             this.log(current, "warning", "Triage gave no decision; using the defaults");
-            triage = {
-              tier: "standard",
-              effort: "medium",
-              needsPlan: settings.planning !== "never",
-              scope: "medium",
-              title: current.title,
-              reasoning: "Fallback: the triage turn did not call shipyard_triage.",
-              verification: [],
-              model: null,
-              reasoningLevel: null,
-              source: "fallback",
-            };
+            ready = this.store.updateTask(taskId, {
+              triage: fallbackTriage(current, "fallback", "Fallback: the triage turn did not call shipyard_triage."),
+            });
           }
-          const withTriage = this.store.updateTask(taskId, { triage });
-          await this.send(withTriage, implementPrompt(withTriage, { includeTask: false }), settings, {
-            model: triage.model,
-            reasoningLevel: triage.reasoningLevel,
-          });
-          this.log(current, "info", "Implementation started");
-          this.store.updateTask(taskId, { phase: "implement" });
+          await this.startBuild(ready);
+          return;
+        }
+        case "plan": {
+          const output = await this.sdk.threads.output({ threadId: current.threadId as string }).catch(() => null);
+          const plan = output?.output?.trim().slice(0, MAX_PLAN_CHARS) || null;
+          const withPlan = this.store.updateTask(taskId, { plan });
+          if (!plan) this.log(current, "warning", "The plan turn gave no text");
+          if (settings.planApproval) {
+            this.log(current, "info", "Plan ready for approval");
+            this.toHumanReview(withPlan, "plan_ready", {
+              error: plan ? null : "The plan turn gave no text. Open the thread to read the plan, or ask for changes.",
+            });
+            return;
+          }
+          await this.implement(withPlan, { afterPlan: true });
           return;
         }
         case "implement":
@@ -802,12 +999,7 @@ export class Engine {
           }
           if (pr) {
             this.log(current, "success", `Pull request opened: ${pr.url}`);
-            this.store.updateTask(taskId, {
-              phase: "review",
-              reviewReason: "pr_created",
-              pullRequest: pr,
-              error: null,
-            });
+            this.store.updateTask(taskId, { phase: "review", reviewReason: "pr_created", pullRequest: pr, error: null });
           } else {
             this.log(current, "warning", "No pull request found for this branch");
             this.store.updateTask(taskId, {
@@ -850,8 +1042,7 @@ export class Engine {
       const fresh = this.ownedRunningTask(task.id, event.threadId);
       if (!fresh) return;
       if (event.errorInfo?.category === "rate-limit" && event.attemptNumber < MAX_RATE_LIMIT_RETRIES) {
-        const resetsAt =
-          event.rateLimits?.windows.find((window) => window.resetsAtMs !== null)?.resetsAtMs ?? null;
+        const resetsAt = event.rateLimits?.windows.find((window) => window.resetsAtMs !== null)?.resetsAtMs ?? null;
         await this.sdk.threads.retry({
           threadId: event.threadId,
           turnRequestId: event.requestId,
@@ -909,14 +1100,22 @@ export class Engine {
           await this.withLock(task.id, async () => {
             const fresh = this.ownedRunningTask(task.id, thread.id);
             if (!fresh) return;
-            this.toHumanReview(fresh, "errors", {
-              error: "The agent thread stopped with an error.",
-            });
+            this.toHumanReview(fresh, "errors", { error: "The agent thread stopped with an error." });
           });
           this.changed(task.projectId);
         }
       } catch (error) {
-        this.bb.log.warn(`reconcile ${task.id}: ${errorMessage(error)}`);
+        const message = errorMessage(error);
+        this.bb.log.warn(`reconcile ${task.id}: ${message}`);
+        // A deleted thread would hold its slot for good.
+        if (/\b404\b|not found/i.test(message)) {
+          await this.withLock(task.id, async () => {
+            const fresh = this.ownedRunningTask(task.id, task.threadId as string);
+            if (!fresh) return;
+            this.toHumanReview(fresh, "errors", { error: "The task's thread no longer exists. Discard the attempt to start again." });
+          });
+          this.changed(task.projectId);
+        }
       }
     }
     this.pump();
@@ -958,20 +1157,12 @@ export class Engine {
       const base = environment.mergeBaseBranch ?? environment.baseBranch ?? environment.defaultBranch;
       let changedFiles = task.changedFiles;
       if (base) {
-        const diff = await this.sdk.environments.diffFiles({
-          environmentId,
-          target: "all",
-          mergeBaseBranch: base,
-        });
+        const diff = await this.sdk.environments.diffFiles({ environmentId, target: "all", mergeBaseBranch: base });
         if (diff.outcome === "available") {
           changedFiles = diff.files.map((file) => file.path).slice(0, 200);
         }
       }
-      this.store.updateTask(task.id, {
-        environmentId,
-        branch: environment.branchName,
-        changedFiles,
-      });
+      this.store.updateTask(task.id, { environmentId, branch: environment.branchName, changedFiles });
     } catch (error) {
       this.bb.log.warn(`workspace refresh ${task.id}: ${errorMessage(error)}`);
     }
@@ -1004,14 +1195,14 @@ export class Engine {
   }
 
   /** The machine of the project's default source; worktrees are created there. */
-  private async projectHost(projectId: string): Promise<string> {
+  async projectHost(projectId: string): Promise<string> {
     const project = await this.sdk.projects.get({ projectId });
     const source = project.sources.find((item) => item.isDefault) ?? project.sources[0];
     if (!source) throw new Error("This project has no source checkout to create a worktree from.");
     return source.hostId;
   }
 
-  private async resolveProvider(projectId: string, settings: ShipyardSettings): Promise<string | null> {
+  async resolveProvider(projectId: string, settings: ShipyardSettings): Promise<string | null> {
     if (settings.providerId) return settings.providerId;
     try {
       const defaults = await this.sdk.projects.defaultExecutionOptions({ projectId });
@@ -1084,3 +1275,5 @@ export class Engine {
     return best ?? model.defaultEffort;
   }
 }
+
+export type { Stage };

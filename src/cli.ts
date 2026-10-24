@@ -12,6 +12,9 @@ import {
   COLUMNS,
   COLUMN_LABELS,
   type ColumnId,
+  PLAN_MODES,
+  PLAN_MODE_LABELS,
+  type PlanMode,
   statusLabel,
 } from "./model";
 import { type StoredTask, type Store, publicTask } from "./store";
@@ -43,7 +46,15 @@ function detail(task: StoredTask, store: Store): string {
   if (task.threadId) lines.push(`Thread: @thread:${task.threadId}${task.branch ? `   Branch: ${task.branch}` : ""}`);
   if (task.pullRequest) lines.push(`Pull request: ${task.pullRequest.url}`);
   if (task.error) lines.push(`Error: ${task.error}`);
+  if (task.signal && (task.reviewReason === "blocked" || task.reviewReason === "needs_input")) {
+    lines.push(
+      `The agent ${task.reviewReason === "blocked" ? "is blocked" : "needs your input"}: ${task.signal.summary}`,
+      `Answer with: bb shipyard feedback ${task.id} "<answer>"`,
+    );
+  }
+  lines.push(`Plan: ${PLAN_MODE_LABELS[task.planMode]}`);
   if (task.description) lines.push("", task.description.slice(0, 4000));
+  if (task.plan) lines.push("", "Plan:", task.plan.slice(0, 4000));
   if (task.triage) {
     lines.push(
       "",
@@ -140,26 +151,42 @@ export function registerCli(bb: BbPluginApi, store: Store, engine: Engine): void
           },
         }),
         create: cliCommand({
-          summary: "Create a task in Planning, or queue it with --start",
+          summary: "Create a task in Ideas; --start queues it and --brainstorm opens a brainstorm",
           positionals: [{ name: "description", description: "What the agent should do", required: true }],
           options: {
             title: { type: "string", description: "Short title (triage writes one when omitted)" },
             start: { type: "boolean", description: "Queue the task now" },
+            brainstorm: { type: "boolean", description: "Start a brainstorm thread to shape the task with you" },
+            plan: { type: "enum", values: [...PLAN_MODES], description: "Plan first: auto (triage decides), always, or skip" },
             project: projectOption,
           },
           async run(input, ctx) {
             const projectId = requireProject(ctx.projectId, input.options.project);
+            if (input.options.start && input.options.brainstorm) {
+              throw new PluginCliError("use --start or --brainstorm, not both", { code: "invalid_options" });
+            }
             const task = await engine.createTask({
               projectId,
               title: input.options.title,
               description: input.positionals.description,
-              start: input.options.start === true,
+              destination: input.options.start ? "queue" : input.options.brainstorm ? "brainstorm" : "ideas",
+              planMode: input.options.plan as PlanMode | undefined,
             });
             return { exitCode: 0, stdout: `Created ${cardLine(task)}` };
           },
         }),
+        idea: cliCommand({
+          summary: "Save an idea in the Ideas column for later",
+          positionals: [{ name: "text", description: "The idea, in a sentence or two", required: true }],
+          options: { project: projectOption },
+          async run(input, ctx) {
+            const projectId = requireProject(ctx.projectId, input.options.project);
+            const task = await engine.createTask({ projectId, description: input.positionals.text, destination: "ideas" });
+            return { exitCode: 0, stdout: `Saved ${cardLine(task)}` };
+          },
+        }),
         start: cliCommand({
-          summary: "Queue a task from Planning, or continue a stopped one",
+          summary: "Queue a task from Ideas or Brainstorm, or continue a stopped one",
           positionals: [{ name: "id", description: "Task id or unique prefix", required: true }],
           async run(input) {
             const task = await engine.runAction(findTask(input.positionals.id).id, "start");
@@ -184,6 +211,14 @@ export function registerCli(bb: BbPluginApi, store: Store, engine: Engine): void
             return { exitCode: 0, stdout: cardLine(task) };
           },
         }),
+        approve: cliCommand({
+          summary: "Approve a task's plan so the agent implements it",
+          positionals: [{ name: "id", description: "Task id or unique prefix", required: true }],
+          async run(input) {
+            const task = await engine.runAction(findTask(input.positionals.id).id, "approve_plan");
+            return { exitCode: 0, stdout: cardLine(task) };
+          },
+        }),
         stop: cliCommand({
           summary: "Stop a running task and move it to Human Review",
           positionals: [{ name: "id", description: "Task id or unique prefix", required: true }],
@@ -193,7 +228,7 @@ export function registerCli(bb: BbPluginApi, store: Store, engine: Engine): void
           },
         }),
         feedback: cliCommand({
-          summary: "Request changes on a reviewed task; the same agent session continues",
+          summary: "Request changes on a reviewed task or plan; the same agent session continues",
           positionals: [
             { name: "id", description: "Task id or unique prefix", required: true },
             { name: "feedback", description: "The changes you want", required: true },

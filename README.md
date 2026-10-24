@@ -1,3 +1,27 @@
+```text
+         /\
+        /  \________________________________
+       |____|_______________________________|
+       | |  |              ||
+       | |  |             [##]                      _|_
+       | |  |                    [##][##]          |   |
+       | |  |    [##][##][##][##][##][##]          |[] |
+       | |  |    [##][##][##][##][##][##][##][##]  |___|
+       | |  |    [##][##][##][##][##][##][##][##]  |   |           _|
+       | |  | _|___________________________________|___|___      _|__|_
+_______| |  | \  o     o     o     o     o     o     o      /    \    /
+==============~\___________________________________________/~~~~~~~~~~~~~~
+  ~     ~      ~     ~       ~     ~      ~      ~     ~      ~     ~
+     ~      ~     ~      ~      ~     ~     ~     ~      ~     ~
+
+   ███████╗ ██╗  ██╗ ██╗ ██████╗  ██╗   ██╗  █████╗  ██████╗  ██████╗
+   ██╔════╝ ██║  ██║ ██║ ██╔══██╗ ╚██╗ ██╔╝ ██╔══██╗ ██╔══██╗ ██╔══██╗
+   ███████╗ ███████║ ██║ ██████╔╝  ╚████╔╝  ███████║ ██████╔╝ ██║  ██║
+   ╚════██║ ██╔══██║ ██║ ██╔═══╝    ╚██╔╝   ██╔══██║ ██╔══██╗ ██║  ██║
+   ███████║ ██║  ██║ ██║ ██║         ██║    ██║  ██║ ██║  ██║ ██████╔╝
+   ╚══════╝ ╚═╝  ╚═╝ ╚═╝ ╚═╝         ╚═╝    ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═════╝
+```
+
 # Shipyard for bb
 
 A Kanban board for coding agents. You write tasks. Each task runs in its own
@@ -11,19 +35,31 @@ Shipyard ports the workflow of
 
 | Column | What happens |
 | --- | --- |
-| Planning | You draft the task. Nothing runs. |
-| Queue | The task waits for a free slot (`maxParallel` per project). |
-| In Progress | A short triage turn picks the model tier, effort, and whether to plan. The same session then implements, verifies, and commits. |
-| AI Review | The same session runs the project's checks, reviews its diff with fresh eyes, and reports through the `shipyard_report` tool. |
-| Human Review | You review. You request changes (the session continues), open a PR, merge, or mark it done. |
+| Ideas | You save ideas for later. Nothing runs. |
+| Brainstorm | An agent asks you questions in its thread and writes the spec with you. Then you choose "Queue it" or "Save for later". |
+| Queue | The task waits for a free slot (parallel tasks per project). |
+| In Progress | The same session runs each stage: Triage, Plan (optional), Build, and Validate. The card shows the stage. |
+| Human Review | You review the work, or approve the plan when plan approval is on. You request changes (the session continues), open a PR, merge, or mark it done. |
 | Done | Finished. |
 
-Moving a card is a command. Drag it to Queue to schedule it, to In Progress to
-run it now, or to AI Review to validate again.
+Moving a card is a command. Drag it to Brainstorm to start a brainstorm, to
+Queue to schedule it, or to In Progress to run it now.
 
 - **Triage.** On Claude Code, the tiers map to model families: light → Haiku,
   standard → Sonnet, deep → Opus, hardest → Fable (off by default). Other
   providers keep their default model and vary only the effort.
+- **Plan first.** Each task has a plan mode: Auto (the project setting, and
+  triage when the setting is automatic), Always, or Skip. The plan is its own
+  turn. Shipyard keeps the plan on the card. With plan approval on, the task
+  stops in Human Review until you approve the plan or ask for changes.
+- **Skills by stage.** Pick skills for each stage, such as `ce-plan` for Plan
+  or `hallmark` for Build. Defaults apply to every project. A project's list
+  for a stage replaces the default list, and a task can add its own skills.
+- **Explicit completion.** Each build stage ends when the agent calls
+  `shipyard_done`. An agent that needs something only you can give (a secret,
+  a decision) ends the stage as "blocked" or "needs input". The task waits in
+  Human Review with its question, and your answer continues the same stage.
+  If an agent stops without the tool, Shipyard treats the stage as done.
 - **Parallel tasks.** Each agent sees the files the project's other open
   tasks change, so it can avoid merge conflicts.
 - **Lessons.** Agents record lasting preferences from your feedback with
@@ -35,24 +71,37 @@ run it now, or to AI Review to validate again.
 - **Rate limits.** A rate-limited turn retries when the limit resets, up to
   five times.
 
+The page has a Board view and a List view. Click a task to open its panel
+with the review, the task details, and the activity.
+
 ## CLI
 
 Any thread in the project can drive the board. The bundled skill teaches
 agents these commands:
 
 ```sh
-bb shipyard list | show <id> | create "<description>" [--start]
-bb shipyard start | move | stop | feedback | pr | merge | done | delete
+bb shipyard list | show <id> | idea "<text>"
+bb shipyard create "<description>" [--start | --brainstorm] [--plan auto|always|skip]
+bb shipyard start | move | approve | stop | feedback | pr | merge | done | delete
 bb shipyard learn "<lesson>" | lessons
 ```
 
 ## Settings
 
-`bb plugin config shipyard` or Settings → Plugins → Shipyard:
-parallel tasks per project, agent provider, triage on or off, allow the top
-tier, planning policy, validation on or off, permission mode (default `full`,
-because the worktree isolates the work), base branch, merge method, and
-archiving threads on Done.
+Open **Settings** on the Shipyard page. Switch between this project and all
+projects. A project can override any default:
+
+- Queue: parallel tasks per project.
+- Pipeline: triage, the most capable model tier, plan first, plan approval,
+  and validation.
+- Agents: provider and permission mode (default `full`, because the worktree
+  isolates the work).
+- Git: base branch, merge method, whether to commit plan documents, and
+  archiving threads on Done.
+- Skills by stage.
+
+The defaults are also on Settings → Plugins → Shipyard and in
+`bb plugin config shipyard`.
 
 ## Requirements
 

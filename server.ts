@@ -4,19 +4,29 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { registerCli } from "./src/cli";
-import { BOARD_CHANGED, Engine, type ShipyardSettings } from "./src/engine";
+import { BOARD_CHANGED, Engine } from "./src/engine";
 import {
   RUNNING_PHASES,
+  STAGES,
   TASK_ACTIONS,
   columnSchema,
+  doneInputSchema,
   lessonSchema,
+  planModeSchema,
   reportSchema,
+  settingsOverridesSchema,
+  settingsPatchSchema,
+  settingsSchema,
+  skillNameSchema,
+  skillSchema,
+  stageSkillsSchema,
   taskEventSchema,
   taskSchema,
   triageSchema,
 } from "./src/model";
 import { threadInstructions } from "./src/prompts";
-import { Store, publicTask } from "./src/store";
+import { Settings } from "./src/settings";
+import { DEFAULTS_ROW, Store, publicTask } from "./src/store";
 
 export type { Lesson, Task, TaskEvent } from "./src/model";
 
@@ -38,7 +48,9 @@ export const rpcContract = defineRpcContract({
         projectId: projectIdSchema,
         title: z.string().trim().max(200).optional(),
         description: z.string().max(20_000),
-        start: z.boolean(),
+        destination: z.enum(["ideas", "brainstorm", "queue"]),
+        planMode: planModeSchema.optional(),
+        stageSkills: stageSkillsSchema.optional(),
       })
       .strict()
       .refine((value) => value.description.trim() || value.title, {
@@ -52,6 +64,8 @@ export const rpcContract = defineRpcContract({
         id: taskIdSchema,
         title: z.string().trim().min(1).max(200).optional(),
         description: z.string().max(20_000).optional(),
+        planMode: planModeSchema.optional(),
+        stageSkills: stageSkillsSchema.optional(),
       })
       .strict(),
     output: taskSchema,
@@ -98,7 +112,42 @@ export const rpcContract = defineRpcContract({
     input: z.object({ id: z.string().trim().min(1).max(100) }).strict(),
     output: z.object({ ok: z.boolean() }),
   },
+  settings_get: {
+    input: z.object({ projectId: projectIdSchema }).strict(),
+    output: settingsViewSchema(),
+  },
+  settings_set: {
+    input: z
+      .object({ projectId: projectIdSchema, scope: z.enum(["defaults", "project"]), patch: settingsPatchSchema })
+      .strict(),
+    output: settingsViewSchema(),
+  },
+  stage_skills_set: {
+    input: z
+      .object({
+        projectId: projectIdSchema,
+        scope: z.enum(["defaults", "project"]),
+        stage: z.enum(STAGES),
+        skills: z.array(skillNameSchema).max(10).nullable(),
+      })
+      .strict(),
+    output: settingsViewSchema(),
+  },
+  skills_list: {
+    input: z.object({ projectId: projectIdSchema }).strict(),
+    output: z.object({ skills: z.array(skillSchema) }),
+  },
 });
+
+/** Everything the settings screen shows for one project. */
+function settingsViewSchema() {
+  return z.object({
+    defaults: settingsSchema,
+    overrides: settingsOverridesSchema,
+    effective: settingsSchema,
+    stageSkills: z.object({ defaults: stageSkillsSchema, project: stageSkillsSchema }),
+  });
+}
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
@@ -135,6 +184,16 @@ export default async function plugin(bb: BbPluginApi) {
       },
       default: "auto",
     },
+    planApproval: {
+      type: "boolean",
+      label: "Wait for my approval of each plan before implementing",
+      default: false,
+    },
+    commitPlans: {
+      type: "boolean",
+      label: "Commit plan and brainstorm documents that skills write",
+      default: false,
+    },
     validation: {
       type: "boolean",
       label: "Validate each task (checks and a fresh-eyes review) before human review",
@@ -170,28 +229,37 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  const readSettings = async (): Promise<ShipyardSettings> => {
+  const readSettings = async () => {
     const values = await settings.get();
-    return {
-      maxParallel: values.maxParallel,
+    return settingsSchema.parse({
+      ...values,
       providerId: values.providerId.trim(),
-      triage: values.triage,
-      allowHardest: values.allowHardest,
-      planning: values.planning as ShipyardSettings["planning"],
-      validation: values.validation,
-      permissionMode: values.permissionMode as ShipyardSettings["permissionMode"],
       baseBranch: values.baseBranch.trim(),
-      mergeMethod: values.mergeMethod as ShipyardSettings["mergeMethod"],
-      archiveOnDone: values.archiveOnDone,
-    };
+    });
   };
 
   const store = Store.open(bb);
-  const engine = new Engine(bb, store, readSettings);
+  const config = new Settings(
+    store,
+    readSettings,
+    (patch) => settings.experimental_set(patch as Parameters<typeof settings.experimental_set>[0]),
+    await readSettings(),
+  );
+  const engine = new Engine(bb, store, config);
 
   settings.onChange(() => {
     // A higher limit can free slots for queued tasks.
-    engine.pump();
+    void config.refresh().then(() => {
+      bb.realtime.publish(BOARD_CHANGED, { projectId: null });
+      engine.pump();
+    });
+  });
+
+  const settingsView = (projectId: string) => ({
+    defaults: config.defaults(),
+    overrides: config.overrides(projectId),
+    effective: config.effective(projectId),
+    stageSkills: { defaults: config.defaultStageSkills(), project: config.projectStageSkills(projectId) },
   });
 
   // --- Thread lifecycle -------------------------------------------------
@@ -235,7 +303,7 @@ export default async function plugin(bb: BbPluginApi) {
       "Record the triage decision for the current Shipyard task: model tier, effort, whether to plan, scope, a short title, and verification commands.",
     presentation: {
       label: { pending: "Recording triage", completed: "Recorded triage" },
-      icon: { glyph: "Gauge" },
+      icon: { glyph: "SlidersHorizontal" },
     },
     parameters: triageSchema,
     async execute(input, { threadId }) {
@@ -249,7 +317,7 @@ export default async function plugin(bb: BbPluginApi) {
       "Record the validation report for the current Shipyard task: status, a summary for the reviewer, the checks you ran, and review findings.",
     presentation: {
       label: { pending: "Recording validation report", completed: "Recorded validation report" },
-      icon: { glyph: "ClipboardCheck" },
+      icon: { glyph: "CircleCheck" },
     },
     parameters: reportSchema,
     async execute(input, { threadId }) {
@@ -263,11 +331,42 @@ export default async function plugin(bb: BbPluginApi) {
       "Record a durable preference or convention for this project, such as one learned from reviewer feedback. Later Shipyard tasks receive it. Not for one-off fixes.",
     presentation: {
       label: { pending: "Recording a project lesson", completed: "Recorded a project lesson" },
-      icon: { glyph: "Lightbulb" },
+      icon: { glyph: "Brain" },
     },
     parameters: z.object({ lesson: z.string().trim().min(1).max(1000) }),
     async execute({ lesson }, { threadId }) {
       return engine.recordLesson(threadId, lesson);
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "shipyard_spec",
+    description:
+      "Save the spec agreed in a Shipyard brainstorm to the task card: a short title and the spec in Markdown. Call it once the user agrees with the spec.",
+    presentation: {
+      label: { pending: "Saving the spec", completed: "Saved the spec" },
+      icon: { glyph: "FileText" },
+    },
+    parameters: z.object({
+      title: z.string().trim().min(1).max(200).optional(),
+      spec: z.string().trim().min(1).max(20_000),
+    }),
+    async execute(input, { threadId }) {
+      return engine.recordSpec(threadId, input);
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "shipyard_done",
+    description:
+      'End the current Shipyard stage: status "done" with a one-line summary, or "blocked" / "needs_input" with exactly what the user must provide. Then end your turn.',
+    presentation: {
+      label: { pending: "Ending the stage", completed: "Ended the stage" },
+      icon: { glyph: "CircleCheck" },
+    },
+    parameters: doneInputSchema,
+    async execute(input, { threadId }) {
+      return engine.recordDone(threadId, input);
     },
   });
 
@@ -296,12 +395,13 @@ export default async function plugin(bb: BbPluginApi) {
           (RUNNING_PHASES.has(other.phase) || other.column === "human_review"),
       );
     return {
-      tools: ["shipyard_triage", "shipyard_report", "shipyard_learn"],
+      tools: ["shipyard_triage", "shipyard_report", "shipyard_learn", "shipyard_spec", "shipyard_done"],
       skills: [],
       instructions: threadInstructions({
         task,
         others,
         lessons: store.listLessons(task.projectId),
+        commitPlans: config.effective(task.projectId).commitPlans,
       }),
     };
   });
@@ -309,19 +409,19 @@ export default async function plugin(bb: BbPluginApi) {
   // --- RPC for the board ------------------------------------------------
 
   bb.rpc.register(rpcContract, {
-    async board_get({ projectId }) {
-      const { maxParallel } = await readSettings();
+    board_get({ projectId }) {
+      const { maxParallel } = config.effective(projectId);
       return {
         tasks: store.listTasks(projectId).map(publicTask),
         lessons: store.listLessons(projectId),
         maxParallel,
       };
     },
-    async task_create({ projectId, title, description, start }) {
-      return publicTask(await engine.createTask({ projectId, title, description, start }));
+    async task_create(input) {
+      return publicTask(await engine.createTask(input));
     },
-    async task_edit({ id, title, description }) {
-      return publicTask(await engine.editTask(id, { title, description }));
+    async task_edit({ id, ...patch }) {
+      return publicTask(await engine.editTask(id, patch));
     },
     async task_move({ id, column, position }) {
       return publicTask(await engine.moveTask(id, column, position));
@@ -346,6 +446,40 @@ export default async function plugin(bb: BbPluginApi) {
       const ok = store.deleteLesson(id);
       if (ok) bb.realtime.publish(BOARD_CHANGED, { projectId: null });
       return { ok };
+    },
+    settings_get({ projectId }) {
+      return settingsView(projectId);
+    },
+    async settings_set({ projectId, scope, patch }) {
+      if (scope === "defaults") await config.setDefaults(patch);
+      else config.setProjectOverrides(projectId, patch);
+      bb.realtime.publish(BOARD_CHANGED, { projectId: scope === "defaults" ? null : projectId });
+      engine.pump();
+      return settingsView(projectId);
+    },
+    stage_skills_set({ projectId, scope, stage, skills }) {
+      config.setStageSkills(scope === "defaults" ? DEFAULTS_ROW : projectId, stage, skills);
+      bb.realtime.publish(BOARD_CHANGED, { projectId: scope === "defaults" ? null : projectId });
+      return settingsView(projectId);
+    },
+    async skills_list({ projectId }) {
+      // Without a setting or project default, ask the first available provider.
+      const providerId =
+        (await engine.resolveProvider(projectId, config.effective(projectId))) ??
+        (await bb.sdk.providers.list().catch(() => [])).find((provider) => provider.available)?.id ??
+        null;
+      if (!providerId) return { skills: [] };
+      try {
+        const { commands } = await bb.sdk.projects.commands({ projectId, provider: providerId });
+        const skills = commands
+          .filter((command) => command.source === "skill")
+          .map((command) => ({ name: command.name, description: command.description ?? "" }))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        return { skills };
+      } catch (error) {
+        bb.log.warn(`skill list for ${projectId}: ${error instanceof Error ? error.message : String(error)}`);
+        return { skills: [] };
+      }
     },
   });
 

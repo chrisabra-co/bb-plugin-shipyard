@@ -1,11 +1,18 @@
 // Shared task model: zod schemas used at the RPC boundary and by the agent
 // tools. app.tsx imports only types from here.
 import { z } from "zod";
-import { COLUMNS, PHASES, REVIEW_REASONS } from "./constants";
+import { COLUMNS, PHASES, PLAN_MODES, REVIEW_REASONS, STAGES } from "./constants";
 
 export * from "./constants";
 
 export const columnSchema = z.enum(COLUMNS);
+export const planModeSchema = z.enum(PLAN_MODES);
+
+export const skillNameSchema = z.string().trim().min(1).max(120).regex(/^[\w.:@/-]+$/, "Skill names hold letters, digits, and . : @ / - _");
+/** Skills to load at each stage, for example { plan: ["compound-engineering:ce-plan"] }. */
+export const stageSkillsSchema = z.partialRecord(z.enum(STAGES), z.array(skillNameSchema).max(10));
+export type StageSkills = z.infer<typeof stageSkillsSchema>;
+
 
 
 export const TIERS = ["light", "standard", "deep", "hardest"] as const;
@@ -94,6 +101,16 @@ export const pullRequestSchema = z.object({
 });
 export type PullRequestInfo = z.infer<typeof pullRequestSchema>;
 
+/** How an agent ends a stage, through the shipyard_done tool. */
+export const SIGNAL_STATUSES = ["done", "blocked", "needs_input"] as const;
+export const doneInputSchema = z.object({
+  status: z.enum(SIGNAL_STATUSES),
+  summary: z.string().trim().min(1).max(4000),
+});
+export type DoneInput = z.infer<typeof doneInputSchema>;
+export const signalSchema = doneInputSchema.extend({ phase: z.enum(PHASES), at: z.number() });
+export type Signal = z.infer<typeof signalSchema>;
+
 export const taskSchema = z.object({
   id: z.string(),
   projectId: z.string(),
@@ -112,6 +129,10 @@ export const taskSchema = z.object({
   report: reportSchema.nullable(),
   pullRequest: pullRequestSchema.nullable(),
   changedFiles: z.array(z.string()),
+  planMode: planModeSchema,
+  stageSkills: stageSkillsSchema,
+  plan: z.string().nullable(),
+  signal: signalSchema.nullable(),
   createdAt: z.number(),
   updatedAt: z.number(),
   startedAt: z.number().nullable(),
@@ -138,6 +159,7 @@ export type Lesson = z.infer<typeof lessonSchema>;
 
 export const TASK_ACTIONS = [
   "start",
+  "approve_plan",
   "stop",
   "retry_validation",
   "discard",
@@ -149,3 +171,32 @@ export const TASK_ACTIONS = [
 ] as const;
 export type TaskAction = (typeof TASK_ACTIONS)[number];
 
+
+/** Settings that a project can override; null in a patch removes an override. */
+export const settingsShape = {
+  maxParallel: z.number().int().min(1).max(24),
+  providerId: z.string().trim().max(100),
+  triage: z.boolean(),
+  allowHardest: z.boolean(),
+  planning: z.enum(["auto", "always", "never"]),
+  planApproval: z.boolean(),
+  commitPlans: z.boolean(),
+  validation: z.boolean(),
+  permissionMode: z.enum(["full", "auto", "accept-edits"]),
+  baseBranch: z.string().trim().max(200),
+  mergeMethod: z.enum(["squash", "merge", "rebase"]),
+  archiveOnDone: z.boolean(),
+};
+export const settingsSchema = z.object(settingsShape);
+export type ShipyardSettings = z.infer<typeof settingsSchema>;
+export const settingsOverridesSchema = settingsSchema.partial();
+export type SettingsOverrides = z.infer<typeof settingsOverridesSchema>;
+export const settingsPatchSchema = z
+  .object(Object.fromEntries(Object.entries(settingsShape).map(([key, schema]) => [key, schema.nullable().optional()])) as {
+    [K in keyof typeof settingsShape]: z.ZodOptional<z.ZodNullable<(typeof settingsShape)[K]>>;
+  })
+  .strict();
+export type SettingsPatch = z.infer<typeof settingsPatchSchema>;
+
+export const skillSchema = z.object({ name: z.string(), description: z.string() });
+export type Skill = z.infer<typeof skillSchema>;

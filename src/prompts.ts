@@ -1,4 +1,4 @@
-// Prompts for each pipeline phase. One agent thread runs every phase in the
+// Prompts for each pipeline stage. One agent thread runs every stage in the
 // same session, so later prompts can rely on what earlier turns explored.
 // Adapted from the task runner and triage prompts of proactive-agent/workbench.
 import type { Lesson, Triage } from "./model";
@@ -17,6 +17,31 @@ function verificationHint(triage: Triage | null): string {
     return `the checks that apply to the code you changed (for example: ${triage.verification.map((command) => `\`${command}\``).join(", ")})`;
   }
   return "the checks that apply to the code you changed (the project's tests, type checker, linter or build)";
+}
+
+/** How every build stage ends. Triage and validation end with their own tools. */
+const DONE = `When the stage is finished, call the \`shipyard_done\` tool once with status "done" and a one-line summary. If you cannot finish without the user (a missing secret or access, an unclear requirement, a decision only they can make), call it with status "blocked" or "needs_input" and say exactly what you need. Then end your turn.`;
+
+/** Put the stage's skills in front of a prompt. Skill names are validated identifiers. */
+export function withSkills(skills: readonly string[], prompt: string): string {
+  if (skills.length === 0) return prompt;
+  const list = skills.map((skill) => `\`${skill}\``).join(", ");
+  return `Before you start this stage, load and follow ${skills.length === 1 ? "this skill" : "these skills"}: ${list}. Use your Skill tool, or your provider's way to invoke a skill by name. If a skill is not available, say so and continue.
+
+${prompt}`;
+}
+
+export function brainstormPrompt(task: StoredTask, opts: { revisit: boolean }): string {
+  const head = opts.revisit
+    ? "The user moved this task back to Brainstorm. Revisit it with them."
+    : "Brainstorm this idea with the user before anyone builds it.";
+  return `${taskBlock(task)}
+
+${head}
+- The user reads this thread and answers here. Ask a few focused questions at a time, and wait for the answers.
+- Explore the code as much as you need, but do not change any files.
+- Work toward an agreed spec: the goal, the scope and what is out of scope, the constraints, and how the user will know it is done.
+- When the user agrees with the spec, call the \`shipyard_spec\` tool once with a short title and the spec in Markdown. Then tell the user to choose "Queue it" or "Save for later" on the card.`;
 }
 
 export function triagePrompt(task: StoredTask, allowHardest: boolean): string {
@@ -43,21 +68,48 @@ List only commands you found evidence for in the project (package.json scripts, 
 Spend at most a few tool calls exploring. Then call \`shipyard_triage\` and stop.`;
 }
 
-export function implementPrompt(task: StoredTask, opts: { includeTask: boolean }): string {
-  const triage = task.triage;
+export function planPrompt(task: StoredTask, opts: { includeTask: boolean; commitPlans: boolean }): string {
   const head = opts.includeTask ? `${taskBlock(task)}\n\n` : "";
-  const plan = triage?.needsPlan
-    ? "First explore the code and write a short plan in your reply: the files to change, the approach and why, the edge cases, and how you will verify it. Then implement the plan."
-    : "Implement the task.";
-  return `${head}${plan} Verify the change with ${verificationHint(triage)}, fix failures you caused, then commit the result in this worktree with a descriptive message. Do not push.
+  const files = opts.commitPlans
+    ? "If you write the plan to a file, commit it with a clear message."
+    : "If a skill writes the plan to a file, leave that file uncommitted; Shipyard keeps the plan on the card.";
+  return `${head}Plan this task before any change. Explore the code as needed, but do not change source files yet.
+Write the plan in your reply, in Markdown: the files to change, the approach and why, the edge cases, and how you will verify it (${verificationHint(task.triage)}).
+${files}
+End your reply with the plan itself; Shipyard saves your final message as the plan.
 
-End with a short summary for the reviewer: what changed, how you verified it, and any assumptions or follow-ups.`;
+${DONE}`;
+}
+
+export function revisePlanPrompt(feedback: string): string {
+  return `The user reviewed the plan and asked for changes:
+
+<feedback>
+${feedback.trim()}
+</feedback>
+
+Revise the plan. Do not change source files yet. End your reply with the full revised plan in Markdown.
+
+${DONE}`;
+}
+
+export function implementPrompt(task: StoredTask, opts: { includeTask: boolean; afterPlan: boolean; commitPlans: boolean }): string {
+  const head = opts.includeTask ? `${taskBlock(task)}\n\n` : "";
+  const start = opts.afterPlan ? "The plan is approved. Implement it." : "Implement the task.";
+  const planFiles = opts.afterPlan && !opts.commitPlans ? " Do not commit plan files written during planning." : "";
+  return `${head}${start} Verify the change with ${verificationHint(task.triage)}, fix failures you caused, then commit the result in this worktree with a descriptive message. Do not push.${planFiles}
+
+End with a short summary for the reviewer: what changed, how you verified it, and any assumptions or follow-ups.
+
+${DONE}`;
 }
 
 export function continuePrompt(task: StoredTask): string {
   return `${taskBlock(task)}
 
-Continue this task from where it stopped. Check \`git status\` and \`git log\` to see what is already done, finish the work, verify it with ${verificationHint(task.triage)}, and commit. Do not push.`;
+Continue this task from where it stopped. Check \`git status\` and \`git log\` to see what is already done, finish the work, verify it with ${verificationHint(task.triage)}, and commit. Do not push.
+
+${DONE}`;
 }
 
 export function validatePrompt(task: StoredTask, baseBranch: string): string {
@@ -77,7 +129,22 @@ ${feedback.trim()}
 </feedback>
 
 Apply them, verify with ${verificationHint(triage)}, and commit the result. Do not push.
-If the feedback shows a durable preference for this project (not a one-off fix), record it with the \`shipyard_learn\` tool so later tasks follow it.`;
+If the feedback shows a durable preference for this project (not a one-off fix), record it with the \`shipyard_learn\` tool so later tasks follow it.
+
+${DONE}`;
+}
+
+/** The user's answer to a stage that stopped as blocked or needs_input. */
+export function answerPrompt(answer: string): string {
+  return `You stopped this stage and asked the user for help. Their answer:
+
+<answer>
+${answer.trim()}
+</answer>
+
+Continue the same stage from where you stopped.
+
+${DONE}`;
 }
 
 export function pullRequestPrompt(task: StoredTask, baseBranch: string): string {
@@ -85,7 +152,9 @@ export function pullRequestPrompt(task: StoredTask, baseBranch: string): string 
 1. Commit anything still uncommitted.
 2. Push this branch to origin.
 3. Create the pull request against \`${baseBranch}\` with \`gh pr create\`. Title: "${quoteAttr(task.title)}". In the body, summarize what changed and how it was verified.
-Reply with the pull request URL.`;
+Reply with the pull request URL.
+
+${DONE}`;
 }
 
 export function resolveConflictsPrompt(base: string, triage: Triage | null): string {
@@ -93,7 +162,9 @@ export function resolveConflictsPrompt(base: string, triage: Triage | null): str
   return `The pull request cannot be merged as is. Bring this branch up to date:
 1. \`git fetch origin\` and merge \`origin/${baseBranch}\` into this branch.
 2. Resolve every conflict so both sides keep their intent. Do not drop lines that \`${baseBranch}\` added.
-3. Verify with ${verificationHint(triage)}, commit the merge, and push the branch.`;
+3. Verify with ${verificationHint(triage)}, commit the merge, and push the branch.
+
+${DONE}`;
 }
 
 /**
@@ -105,13 +176,19 @@ export function threadInstructions(opts: {
   task: StoredTask;
   others: StoredTask[];
   lessons: Lesson[];
+  commitPlans: boolean;
 }): string {
+  // A live session keeps the instructions it started with, so they hold for
+  // every stage; each stage's prompt says whether the user takes part.
   const sections: string[] = [
-    `You are running a Shipyard task (id ${opts.task.id}). Nobody watches this session live and nobody can answer questions: make reasonable assumptions, state them in your final summary, and keep going.
+    `You are working on a Shipyard task (id ${opts.task.id}). Each Shipyard prompt names its stage.
+- In a brainstorm, the user reads this thread and answers you. Do not change files.
+- In every other stage, nobody watches this session live and nobody can answer questions: make reasonable assumptions, state them in your final summary, and keep going.
 - Your working directory is an isolated git worktree. Stay inside it. Never push unless a Shipyard prompt asks for it; never force-push, rewrite the base branch's history, publish packages, or deploy.
 - Follow the project's CLAUDE.md or AGENTS.md, conventions and existing patterns. Keep the change focused on the task.
 - Use subagents only for broad searches or independent investigations. Do the implementation yourself.
-- Show evidence for verification rather than asserting success.`,
+- Show evidence for verification rather than asserting success.
+- End each stage the way its prompt says: \`shipyard_triage\` for triage, \`shipyard_report\` for validation, and \`shipyard_done\` for the others. If you are stuck on something only the user can give you, call \`shipyard_done\` with status "blocked" or "needs_input" instead of guessing.${opts.commitPlans ? "" : "\n- Do not commit plan or brainstorm documents that skills write (for example under docs/plans/ or docs/brainstorms/)."}`,
   ];
 
   const others = opts.others

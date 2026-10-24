@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { experimental_VoiceInputTextarea as VoiceInputTextarea } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -12,11 +11,25 @@ import {
 } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
-import type { Lesson } from "../model";
-import { type ShipyardRpc, attempt } from "./shared";
+import { cn } from "@/lib/utils";
+import { PLAN_MODES, PLAN_MODE_LABELS, type PlanMode } from "../constants";
+import type { Lesson, StageSkills } from "../model";
+import { Segmented, type ShipyardRpc, attempt, textareaClass } from "./shared";
+import { TaskSkillsEditor, useSkills } from "./skills";
 
-const textareaClass =
-  "min-h-36 w-full resize-y rounded-md border border-input bg-transparent px-3 py-2 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring";
+type Destination = "ideas" | "brainstorm" | "queue";
+
+const DESTINATIONS: readonly { value: Destination; label: string }[] = [
+  { value: "queue", label: "Queue" },
+  { value: "brainstorm", label: "Brainstorm" },
+  { value: "ideas", label: "Ideas" },
+];
+
+const DESTINATION_TEXT: Record<Destination, { hint: string; submit: string }> = {
+  queue: { hint: "An agent starts when a slot is free.", submit: "Create and queue" },
+  brainstorm: { hint: "An agent asks you questions in its thread and writes the spec with you.", submit: "Start brainstorm" },
+  ideas: { hint: "Saved for later. Nothing runs.", submit: "Save idea" },
+};
 
 export function NewTaskDialog({
   open,
@@ -29,9 +42,13 @@ export function NewTaskDialog({
   rpc: ShipyardRpc;
   onClose: () => void;
 }) {
+  const skills = useSkills(rpc, projectId);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [start, setStart] = useState(true);
+  const [destination, setDestination] = useState<Destination>("queue");
+  const [planMode, setPlanMode] = useState<PlanMode>("auto");
+  const [stageSkills, setStageSkills] = useState<StageSkills>({});
+  const [showSkills, setShowSkills] = useState(false);
   const [voiceActive, setVoiceActive] = useState(false);
   const [pending, setPending] = useState(false);
 
@@ -45,64 +62,119 @@ export function NewTaskDialog({
         projectId,
         title: title.trim() || undefined,
         description,
-        start,
+        destination,
+        planMode,
+        stageSkills,
       }),
     );
     setPending(false);
     if (created) {
       setTitle("");
       setDescription("");
+      setPlanMode("auto");
+      setStageSkills({});
+      setShowSkills(false);
       onClose();
     }
   };
 
   return (
     <Dialog open={open} onOpenChange={(next) => (next ? undefined : onClose())}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>New task</DialogTitle>
           <DialogDescription>
-            An agent does the work in its own git worktree. Nothing reaches your branch until you review it.
+            An agent works in its own git worktree. Nothing reaches your branch until you review it.
           </DialogDescription>
         </DialogHeader>
         <form
-          className="space-y-3"
+          className="space-y-4"
           onSubmit={(event) => {
             event.preventDefault();
             void submit();
           }}
         >
-          <Input
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            placeholder="Title (optional; triage writes one)"
-            aria-label="Title"
-          />
-          <VoiceInputTextarea
-            value={description}
-            onValueChange={setDescription}
-            onVoiceInputActiveChange={setVoiceActive}
-            placeholder="Describe the goal, the constraints, and how you will know it is done."
-            aria-label="Description"
-            className={textareaClass}
-            autoFocus
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
-                event.preventDefault();
-                void submit();
-              }
-            }}
-          />
-          <label className="flex w-fit cursor-pointer items-center gap-2 text-sm">
-            <Checkbox checked={start} onCheckedChange={(checked) => setStart(checked === true)} />
-            Queue it now
-          </label>
+          <div className="space-y-2">
+            <Input
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="Title (optional; triage writes one)"
+              aria-label="Title"
+            />
+            <VoiceInputTextarea
+              value={description}
+              onValueChange={setDescription}
+              onVoiceInputActiveChange={setVoiceActive}
+              placeholder="Describe the goal, the constraints, and how you will know it is done."
+              aria-label="Description"
+              className={cn(textareaClass, "min-h-36")}
+              autoFocus
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault();
+                  void submit();
+                }
+              }}
+            />
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <p className="text-sm font-medium">Send to</p>
+              <Segmented<Destination> label="Send to" value={destination} options={DESTINATIONS} onChange={setDestination} />
+              <p className="text-xs text-muted-foreground">{DESTINATION_TEXT[destination].hint}</p>
+            </div>
+            <div className="space-y-1.5">
+              <p className="text-sm font-medium">Plan first</p>
+              <Segmented<PlanMode>
+                label="Plan first"
+                value={planMode}
+                options={PLAN_MODES.map((mode) => ({ value: mode, label: PLAN_MODE_LABELS[mode] }))}
+                onChange={setPlanMode}
+              />
+              <p className="text-xs text-muted-foreground">
+                {planMode === "auto"
+                  ? "Follows the project setting."
+                  : planMode === "always"
+                    ? "Plan before any change."
+                    : "Skip the plan. Good for small, clear tasks."}
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <button
+              type="button"
+              aria-expanded={showSkills}
+              onClick={() => setShowSkills((value) => !value)}
+              className="inline-flex items-center gap-1 rounded text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <Icon
+                name="ChevronRight"
+                aria-hidden
+                className={cn("size-4 text-muted-foreground motion-safe:transition-transform", showSkills && "rotate-90")}
+              />
+              Skills for this task
+              {Object.keys(stageSkills).length > 0 ? (
+                <span className="font-normal text-muted-foreground">
+                  ({Object.values(stageSkills).reduce((sum, list) => sum + (list?.length ?? 0), 0)})
+                </span>
+              ) : null}
+            </button>
+            {showSkills ? (
+              <div className="space-y-2 pl-5">
+                <p className="text-xs text-muted-foreground">These add to the project's skills for each stage.</p>
+                <TaskSkillsEditor value={stageSkills} onChange={setStageSkills} suggestions={skills} />
+              </div>
+            ) : null}
+          </div>
+
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={onClose}>
               Cancel
             </Button>
             <Button type="submit" disabled={!canSubmit}>
-              {start ? "Create and queue" : "Create"}
+              {DESTINATION_TEXT[destination].submit}
             </Button>
           </DialogFooter>
         </form>
@@ -163,9 +235,7 @@ export function LessonsDialog({
           </Button>
         </form>
         {lessons.length === 0 ? (
-          <p className="rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground">
-            No lessons yet.
-          </p>
+          <p className="py-4 text-sm text-muted-foreground">No lessons yet.</p>
         ) : (
           <ul className="divide-y divide-border rounded-lg border border-border">
             {lessons.map((lesson) => (

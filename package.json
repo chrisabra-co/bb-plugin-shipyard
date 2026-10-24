@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-shipyard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A Kanban board for coding agents: each task runs in its own bb thread and git worktree, then waits for your review.",
   "license": "MIT",
   "author": "Chris Abra (https://github.com/chrisabra-co)",
@@ -22,11 +22,11 @@
   },
   "bb": {
     "name": "Shipyard",
-    "description": "Plan tasks on a Kanban board. Each task runs in its own thread and git worktree: triage, implementation, and validation run before your review. Then you merge.",
+    "description": "Capture ideas, brainstorm them with an agent, and queue tasks on a Kanban board. Each task runs in its own thread and git worktree: triage, an optional plan, implementation, and validation run before your review. Then you merge.",
     "branding": {
-      "icon": "./assets/kanban.svg",
+      "icon": "./assets/shipyard.svg",
       "experimental_icons": {
-        "kanban": "./assets/kanban.svg"
+        "ship": "./assets/shipyard.svg"
       }
     },
     "server": "./server.ts",
